@@ -21,7 +21,7 @@ def random_rotation(seed: int) -> torch.Tensor:
 
 def noisy_pose(batch: dict, t: float = 0.5) -> torch.Tensor:
     torch.manual_seed(1)
-    noise = batch["ref_center"][:, None] + 4.0 * torch.randn_like(batch["lig_pos"])
+    noise = batch["pocket_com"][:, None] + 4.0 * torch.randn_like(batch["lig_pos"])
     return ((1 - t) * noise + t * batch["lig_pos"]) * batch["lig_mask"][..., None]
 
 
@@ -37,7 +37,7 @@ def test_se3_equivariance(items, random_model):
     batch = collate(items)
     x_t, t = noisy_pose(batch), torch.tensor([0.2, 0.7])
     R, shift = random_rotation(0), torch.tensor([3.0, -7.0, 11.0])
-    moved = dict(batch, poc_pos=batch["poc_pos"] @ R.T + shift, ref_center=batch["ref_center"] @ R.T + shift)
+    moved = dict(batch, poc_pos=batch["poc_pos"] @ R.T + shift, pocket_com=batch["pocket_com"] @ R.T + shift)
     with torch.no_grad():
         out = random_model(batch, x_t, t)
         out_moved = random_model(moved, x_t @ R.T + shift, t)

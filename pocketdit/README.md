@@ -5,8 +5,8 @@
 
 ```
 pocketdit/
-  chem.py    PDB/SDF 解析、口袋提取、配体与口袋特征化              ~220 行
-  data.py    预处理成 .pt 缓存、Dataset、padding 批处理              ~160 行
+  chem.py    PDB/SDF 解析、口袋提取与中心、配体与口袋特征化          ~280 行
+  data.py    预处理成 .pt 缓存、口袋预算裁剪、Dataset、padding 批处理  ~250 行
   model.py   静态口袋编码器 + Geometric DiT + 等变输出头              ~260 行
   flow.py    先验、插值路径、损失、Euler 采样器                       ~85 行
   train.py   纯 PyTorch 训练循环（AdamW、warmup+cosine、EMA、bf16）    ~200 行
@@ -26,21 +26,39 @@ Ligand 分子图 + x_t ──► Atom Embedding ──► Geometric DiT × depth
                                               └ adaLN-Zero（flow time t 调制三个子层）
 ```
 
-- **Token**：配体每个重原子一个 token；口袋取参考配体 8 Å 内残基的全部重原子（约 350–450 个）。
+- **Token**：配体每个重原子一个 token；口袋是**按距离排序、整残基选取、截到 256 个原子**的重原子集合（见下文"口袋预算"）。
 - **几何只通过注意力 bias 进入主干**：用 `F.scaled_dot_product_attention` 的加性 mask 实现，主干几乎全是稠密矩阵乘法，没有 PairFormer 和 triangle 操作。
 - **输出头**：`Δx_i = mean_j w_ij·r̂_ij + mean_k w_ik·r̂_ik`，其中 w 是不变标量，r̂ 是相对向量，所以 `x̂_1 = x_t + Δx` 在构造上就是 SE(3) 等变的，不需要旋转数据增强。
 - **手性**：只看距离的模型分不清镜像，生成时会翻转手性中心。所以给每个立体中心加一个特征 `sign · 有向体积(x_t)`：它在旋转下不变，在镜像下变号。参考符号取自输入的 3D 构象，避开了 RDKit 中 CW/CCW 邻居顺序的约定。这样模型是 SE(3) 而不是 E(3) 等变的，有测试覆盖。
 - adaLN-Zero 和输出头都是零初始化：初始化时模型恒等输出 `x̂_1 = x_t`。
+
+## 口袋预算
+
+缓存时按 8 Å 存下最宽的那一层壳，加载每个复合物时再裁到预算（`data.PocketCrop`）：
+
+- **只按整残基选，按残基到参考配体的最小距离排序。** 4 Å 以内的是接触壳，优先保留；其余按从近到远填满预算。
+- **4 Å 核心 + 不设 cutoff 单靠 256 预算填**，在 10 个示例复合物上等效 cutoff 自己就落在平均 **6.5 Å**（范围 5.8–6.9）—— 而这正是 SigmaDock 训练用的口袋尺度（`pocket_distance_cutoff: 6.0` + `pocket_distance_noise: 0.5`）。所以 `cutoff` 默认取 6.5：两个控制量互相印证，实测下来两者都会生效（约 4 个复合物先碰到预算，约 6 个先碰到 cutoff），最终 **203–253 个原子 / 等效 5.8–6.5 Å**，对比 8 Å 整壳的 348–444 个。
+- 显存上，10 个复合物一个 batch：`PocketEncoder` 里 `[B,M,M,16]` 的 RBF 从 126 MB 降到 41 MB，`z_lp` 的 `[B,N,M,64]` 从 40 MB 降到 23 MB。
+- 半个残基对 `ATOM_NAMES` / `RESIDUES` 嵌入是分布外的（没有 CA 的骨架 N、苯环的三个碳），所以不做原子级选取；按距离截断也优于在 4–8 Å 带里均匀采样 —— 后者会留下 7.9 Å 的原子而丢掉 4.1 Å 的。
+- 顺带的收益：输出头把口袋项按 `n_p` 取平均，400 个大多很远的原子会把约 37 个真实接触稀释 10 倍，而 `n_p` 在不同复合物间从 126 变到 600 又会让这一项的尺度跟着变。
+- **预算是上限不是配额。** 小而深的口袋就保持小，不会用溶剂暴露的残基填到 256；核心本身超预算时丢掉它最远的残基，大配体退化成最近的接触而不是整条样本作废。
+- **随机性加在边界上，不加在单个原子上**：cutoff 抖动（`U[cutoff ± 1.5]`，实测让同一个复合物的口袋在 138–256 个原子之间变动）加整残基 dropout。随机丢原子会在口袋壁上打洞，同一个复合物在不同 epoch 学到的立体场就不自洽了。验证和推理用确定性的那层壳。
 
 ## Flow Matching
 
 | | |
 |---|---|
 | 路径 | `x_t = (1−t)·x_0 + t·x_1`，t=1 是真实位姿 |
-| 先验 | `x_0 ~ N(口袋中心, 4² Å²)`，训练时中心另加 1 Å 抖动 |
+| 先验 | `x_0 ~ N(口袋中心, 4² Å²)`，中心抖动训练 1 Å / 采样 0.25 Å |
 | 预测目标 | `x̂_1 = E[x_1 \| x_t]`，速度 `v = (x̂_1 − x_t)/(1−t)` |
 | 损失 | 坐标 MSE（Å²，即每个复合物的 RMSD²）+ `t > 0.75` 时对真实距离 < 3 Å 的原子对（键长、键角）加距离损失 |
 | 采样 | 20 步 Euler ODE，最后一步正好落在 `x̂_1` 上；口袋编码缓存复用 |
+
+**口袋中心（`pocket_com`）**：参考配体 6 Å 以内**蛋白重原子**的质心，和 SigmaDock 的 `extract_pocket_com` 一致 —— 不是参考配体自己的质心。模型是平移等变的（主干只看距离，输出头只输出相对向量），绝对坐标进不了网络，所以中心**只**通过先验起作用；要训练和推理一致的，是"先验中心到真实配体质心"这个偏移的**分布**。
+
+用配体质心做中心会破坏这个一致性：重对接训练时它就是答案的质心，模型不需要学平移；到推理时中心偏出几 Å，模型就系统性地平移不足。口袋质心在 10 个示例复合物上离真实配体质心 1.7 Å（0.8–3.5 Å），是一个真要去解的平移；抖动则负责把推理时的中心误差覆盖进训练分布，所以采样时也保留（0.25 Å）而不是关掉。
+
+诊断用 **`centroid_err`**（`flow.centroid_error`）：训练指标和 `val/centroid_err_median` 都有。它是唯一能暴露先验泄漏的数 —— 如果重对接上它趋近 0 而交叉对接上明显变大，说明模型在从先验里读答案，而总 RMSD 会把这件事藏起来。
 
 ## 使用
 
@@ -56,16 +74,20 @@ python -m pocketdit.data --root data/pdbbind/refined-set --out cache/train \
 python -m pocketdit.data --root data/pdbbind/core-set --out cache/val
 ```
 
+`--pocket_cutoff` 是**缓存**的最宽壳，不是训练用的口袋 —— 预算裁剪在加载时做，所以改预算、改 cutoff 抖动都不需要重跑预处理。`--com_cutoff` 决定先验中心取哪一层壳的质心（默认 6 Å）。
+
 也可以用 `--csv index.csv`，列为 `protein,ligand[,ref]`，路径相对于 CSV 所在目录。交叉对接时用 `--ref_glob` 指定参考配体，由它来定义口袋。解析失败的复合物会记录在 `<out>/failures.txt`。
 
-**2. 训练**：`TrainConfig`、`ModelConfig`、`FlowConfig` 的每个字段都是命令行参数。
+**2. 训练**：`TrainConfig`、`ModelConfig`、`FlowConfig`、`PocketCrop` 的每个字段都是命令行参数。
 
 ```bash
 python -m pocketdit.train --train_dir cache/train --val_dir cache/val --out_dir runs/exp1 \
-    --batch_size 16 --lr 3e-4 --max_steps 200000 --model.dim 256 --model.depth 6 --flow.prior_std 4
+    --batch_size 16 --lr 3e-4 --max_steps 200000 --model.dim 256 --model.depth 6 \
+    --crop.max_atoms 256 --crop.core_cutoff 4 --crop.cutoff 6.5 --crop.cutoff_jitter 1.5 \
+    --flow.prior_std 4 --flow.center_noise 1.0
 ```
 
-日志写到 `runs/exp1/log.jsonl`。验证时用 EMA 模型报告 loss、采样 RMSD 中位数和 RMSD < 2 Å 的比例。`--resume runs/exp1/last.pt` 可以断点续训。
+日志写到 `runs/exp1/log.jsonl`。验证时用 EMA 模型报告 loss、采样 RMSD 中位数、RMSD < 2 Å 的比例和质心误差中位数。`--resume runs/exp1/last.pt` 可以断点续训。
 
 **3. 对接**：
 
@@ -77,6 +99,8 @@ python -m pocketdit.dock --ckpt runs/exp1/last.pt --protein p.pdb --ligand query
 python -m pocketdit.dock --ckpt runs/exp1/last.pt --protein p.pdb --ligand query.sdf --center 12.3 4.5 -7.8
 ```
 
+口袋预算和先验设置都存在 checkpoint 里，推理会自动复现训练时的口袋，不需要重复传参（`--max_pocket_atoms` 可以覆盖）。两种定义口袋的方式里**参考配体更可靠**：`--center` 只给一个点，口袋只能是绕它的一个球（`--center_margin` 默认 6 Å，约一个配体半径），而不是贴着一个合理配体的壳。
+
 每个复合物输出 `docked/<name>.sdf`，包含 `--num_samples` 个位姿，**未排序**。属性 `rmsd_to_input` 是相对输入坐标的对称性校正 RMSD，只在重对接时有意义。
 
 ## 测试
@@ -85,12 +109,13 @@ python -m pocketdit.dock --ckpt runs/exp1/last.pt --protein p.pdb --ligand query
 pytest -q        # CPU 约 45 秒，使用 ../notebooks/dummy_data 中的 10 个 Astex 复合物
 ```
 
-覆盖内容：PDB 解析和口袋提取；手性特征的符号；随机权重下的 SE(3) 等变性；镜像下输出确实不同；padding 不变性；用"总是给出真值的 oracle"检验采样器的积分；小模型从噪声过拟合单个复合物（中位 RMSD < 1.5 Å）；预处理 → 训练 → 对接的端到端命令行。
+覆盖内容：PDB 解析和口袋提取；口袋预算（整残基、按距离排序、上限语义、核心超预算的退化、cutoff 抖动不拆残基、验证时确定性）；先验中心取的是口袋质心而非配体质心；手性特征的符号；随机权重下的 SE(3) 等变性；镜像下输出确实不同；padding 不变性；用"总是给出真值的 oracle"检验采样器的积分；小模型从噪声过拟合单个复合物（中位 RMSD < 1.5 Å）；预处理 → 训练 → 对接的端到端命令行，含 `--center` 路径。
 
 ## 已知局限和下一步
 
-- **还没有在真实数据集上训练过**，没有 benchmark 数字。默认超参数（先验 4 Å、口袋 8 Å、距离损失权重等）都是合理的起点，没有经过调优。
+- **还没有在真实数据集上训练过**，没有 benchmark 数字。默认超参数（先验 4 Å、预算 256、cutoff 抖动 1.5 Å、距离损失权重等）都是合理的起点，没有经过调优。`crop.shell_dropout` 默认关着：cutoff 抖动已经在动边界了，再叠一层整残基 dropout 是否有用需要实测。
 - **没有置信度或打分模型**，多个采样位姿无法排序。可以加一个 confidence head，或者接 GNINA / Vina 重打分。
 - 坐标 MSE 没有处理**对称等价原子**（例如羧基的两个 O、对称苯环），评估时请用对称性校正的 RMSD（`dock.py` 中已用 RDKit `CalcRMS`）。
-- 训练时口袋由真实配体选出，口袋形状会泄露一部分配体信息；交叉对接时可以加大 `--pocket_cutoff` 或对 cutoff 加噪声。
-- 可尝试的扩展：harmonic prior（按键图的拉普拉斯构造先验）、self-conditioning、非均匀的 t 采样和时间步长，以及 SigmaDock 式的刚性片段参数化（输出头不变，把逐原子向量聚合成片段的力和力矩）。
+- 训练时口袋仍由真实配体选出，**口袋形状仍会泄露一部分配体信息**（4 Å 核心的轮廓贴着真实位姿）。cutoff 抖动把边界模糊掉了一部分，中心泄漏已经靠 `pocket_com` 堵住，但形状这一项没有。更彻底的做法是改成"绕口袋中心半径 R 的球"，这样只泄漏中心和半径、不泄漏配体形状；代价是球会把预算花在溶剂暴露的方向上。值得用 `centroid_err` 的重对接/交叉对接差值来量这件事还剩多少。
+- 先验是逐原子独立的高斯，原子间距期望约 9.8 Å，比真实分子散得多；harmonic prior（按键图的拉普拉斯构造先验）应该更贴。
+- 其他可尝试的扩展：self-conditioning、非均匀的 t 采样和时间步长，以及 SigmaDock 式的刚性片段参数化（输出头不变，把逐原子向量聚合成片段的力和力矩）。

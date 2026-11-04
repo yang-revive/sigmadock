@@ -189,33 +189,94 @@ def read_pdb(path: str | Path) -> dict[str, np.ndarray]:
     }
 
 
-def featurize_pocket(protein: dict[str, np.ndarray], ref_pos: np.ndarray, cutoff: float) -> dict[str, torch.Tensor]:
-    """All heavy atoms of residues that have any atom within ``cutoff`` Å of the reference ligand."""
-    dist = np.linalg.norm(protein["pos"][:, None] - ref_pos[None], axis=-1).min(axis=1)
-    keep_res = set(protein["resid"][dist < cutoff])
-    keep = np.array([r in keep_res for r in protein["resid"]])
-    if not keep.any():
-        raise ValueError(f"No protein residue within {cutoff} Å of the reference ligand")
+def _min_dist(protein: dict[str, np.ndarray], ref_pos: np.ndarray) -> np.ndarray:
+    """Distance of every protein atom to the nearest reference point (Å)."""
+    return np.linalg.norm(protein["pos"][:, None] - ref_pos[None], axis=-1).min(axis=1)
+
+
+def pocket_center(
+    protein: dict[str, np.ndarray], ref_pos: np.ndarray, com_cutoff: float = 6.0, dist: np.ndarray | None = None
+) -> np.ndarray:
+    """Centre of mass of the protein heavy atoms within ``com_cutoff`` Å of the reference.
+
+    This is the centre the flow prior is built around, and it is a function of the protein and the
+    reference only -- so training (reference = the bound ligand) and inference (a reference ligand,
+    or an explicit centre) compute it the same way. The reference ligand's *own centroid* does not
+    have that property: in re-docking training it is exactly the centroid of the answer, so the
+    model never has to learn a translation, and then under-translates at inference where the centre
+    is off by a few Å. On the ten example complexes this pocket CoM sits 1.7 Å (0.8-3.5 Å) away
+    from the bound ligand's centroid, i.e. far enough to be a real translation to solve.
+
+    A single reference point is taken at face value: it already is a stated pocket centre.
+    """
+    ref_pos = np.asarray(ref_pos, dtype=np.float32).reshape(-1, 3)
+    if len(ref_pos) == 1:
+        return ref_pos[0].copy()
+    dist = _min_dist(protein, ref_pos) if dist is None else dist
+    near = protein["pos"][dist < com_cutoff]
+    return near.mean(axis=0) if len(near) else ref_pos.mean(axis=0)
+
+
+def featurize_pocket(
+    protein: dict[str, np.ndarray], ref_pos: np.ndarray, cutoff: float = 8.0, dist: np.ndarray | None = None
+) -> dict[str, torch.Tensor]:
+    """All heavy atoms of every residue with an atom within ``cutoff`` Å of the reference.
+
+    Atoms come out grouped by residue, with the residues ordered by their distance to the
+    reference; ``poc_res_id`` and ``poc_res_dmin`` record that grouping. A distance-ranked prefix
+    of whole residues is therefore a valid smaller pocket, which is exactly what
+    ``data.crop_pocket`` keeps when it narrows this to a budget.
+    """
+    dist = _min_dist(protein, ref_pos) if dist is None else dist
+    uniq, inv = np.unique(protein["resid"], return_inverse=True)
+    inv = inv.ravel()
+    res_dmin = np.full(len(uniq), np.inf, dtype=np.float32)
+    np.minimum.at(res_dmin, inv, dist.astype(np.float32))
+
+    kept = np.flatnonzero(res_dmin < cutoff)
+    if kept.size == 0:
+        raise ValueError(f"No protein residue within {cutoff} Å of the reference")
+    kept = kept[np.argsort(res_dmin[kept], kind="stable")]  # nearest residue first
+    rank = np.full(len(uniq), -1, dtype=np.int64)
+    rank[kept] = np.arange(len(kept))
+    atom_rank = rank[inv]  # -1 for atoms outside the pocket
+    sel = np.flatnonzero(atom_rank >= 0)
+    sel = sel[np.argsort(atom_rank[sel], kind="stable")]  # atoms grouped by residue
+
     feat = np.stack(
         [
-            [_index(ELEMENTS, e) for e in protein["element"][keep]],
-            [_index(ATOM_NAMES, n) for n in protein["name"][keep]],
-            [_index(RESIDUES, r) for r in protein["resname"][keep]],
+            [_index(ELEMENTS, e) for e in protein["element"][sel]],
+            [_index(ATOM_NAMES, n) for n in protein["name"][sel]],
+            [_index(RESIDUES, r) for r in protein["resname"][sel]],
         ],
         axis=1,
     ).astype(np.int64)
-    return {"poc_feat": torch.from_numpy(feat), "poc_pos": torch.from_numpy(protein["pos"][keep])}
+    return {
+        "poc_feat": torch.from_numpy(feat),
+        "poc_pos": torch.from_numpy(protein["pos"][sel]),
+        "poc_res_id": torch.from_numpy(atom_rank[sel]),  # [M] residue rank of each atom, ascending
+        "poc_res_dmin": torch.from_numpy(res_dmin[kept]),  # [R] distance of each residue, ascending
+    }
 
 
 def featurize_complex(
-    protein_pdb: str | Path, ligand: Chem.Mol, ref_pos: np.ndarray, pocket_cutoff: float = 8.0
+    protein_pdb: str | Path,
+    ligand: Chem.Mol,
+    ref_pos: np.ndarray,
+    pocket_cutoff: float = 8.0,
+    com_cutoff: float = 6.0,
 ) -> dict[str, torch.Tensor]:
     """Ligand + pocket features. ``ref_pos`` (Å) defines the pocket and the prior centre.
 
-    Re-docking: ``ref_pos`` is the ligand's own crystal pose. Cross-docking: a reference ligand.
+    Re-docking: ``ref_pos`` is the ligand's own crystal pose. Cross-docking: a reference ligand, or
+    a single point for an explicit pocket centre. ``pocket_cutoff`` is the *widest* shell ever
+    needed: the pocket is narrowed to an atom budget by ``data.crop_pocket`` when a complex is
+    loaded, so cache once at 8 Å and crop afterwards.
     """
     ref_pos = np.asarray(ref_pos, dtype=np.float32).reshape(-1, 3)
+    protein = read_pdb(protein_pdb)
+    dist = _min_dist(protein, ref_pos)
     out = featurize_ligand(ligand)
-    out.update(featurize_pocket(read_pdb(protein_pdb), ref_pos, pocket_cutoff))
-    out["ref_center"] = torch.from_numpy(ref_pos.mean(axis=0))
+    out.update(featurize_pocket(protein, ref_pos, pocket_cutoff, dist))
+    out["pocket_com"] = torch.from_numpy(pocket_center(protein, ref_pos, com_cutoff, dist))
     return out

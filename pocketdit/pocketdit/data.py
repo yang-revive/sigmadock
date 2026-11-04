@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from dataclasses import dataclass
 from multiprocessing import Pool
 from pathlib import Path
 
@@ -54,15 +55,15 @@ def complex_name(row: Row) -> str:
 # --------------------------------------------------------------------------------------
 # Preprocessing
 # --------------------------------------------------------------------------------------
-def _process(job: tuple[Row, Path, float, int]) -> str | None:
-    (protein, ligand, ref), out_dir, cutoff, max_atoms = job
+def _process(job: tuple[Row, Path, float, float, int]) -> str | None:
+    (protein, ligand, ref), out_dir, cutoff, com_cutoff, max_atoms = job
     name = complex_name((protein, ligand, ref))
     try:
         mol = load_ligand(ligand)
         if mol.GetNumAtoms() > max_atoms:
             raise ValueError(f"{mol.GetNumAtoms()} heavy atoms > {max_atoms}")
         ref_pos = load_ligand(ref).GetConformer().GetPositions() if ref else mol.GetConformer().GetPositions()
-        item = featurize_complex(protein, mol, ref_pos, pocket_cutoff=cutoff)
+        item = featurize_complex(protein, mol, ref_pos, pocket_cutoff=cutoff, com_cutoff=com_cutoff)
         item["name"] = name
         torch.save(item, out_dir / f"{name}.pt")
         return None
@@ -70,10 +71,12 @@ def _process(job: tuple[Row, Path, float, int]) -> str | None:
         return f"{name}: {e}"
 
 
-def preprocess(rows: list[Row], out_dir: str | Path, pocket_cutoff: float, max_atoms: int, workers: int) -> None:
+def preprocess(
+    rows: list[Row], out_dir: str | Path, pocket_cutoff: float, com_cutoff: float, max_atoms: int, workers: int
+) -> None:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    jobs = [(row, out_dir, pocket_cutoff, max_atoms) for row in rows]
+    jobs = [(row, out_dir, pocket_cutoff, com_cutoff, max_atoms) for row in rows]
     if workers > 1:
         with Pool(workers) as pool:
             errors = [e for e in pool.imap_unordered(_process, jobs, chunksize=8) if e]
@@ -84,19 +87,84 @@ def preprocess(rows: list[Row], out_dir: str | Path, pocket_cutoff: float, max_a
 
 
 # --------------------------------------------------------------------------------------
+# Narrowing the cached pocket to an atom budget
+# --------------------------------------------------------------------------------------
+@dataclass
+class PocketCrop:
+    """How a cached pocket is narrowed to a budget of atoms.
+
+    Whole residues only, ranked by their distance to the reference: residues closer than
+    ``core_cutoff`` are the contact shell and are kept first, the rest fill the remaining budget
+    nearest-first. A 4 Å core plus a fill to 256 atoms reaches an effective cutoff of 6.5 Å on the
+    ten example complexes -- which is what SigmaDock itself trains with (6.0 Å + 0.5 Å of noise) --
+    against ~400 atoms for the plain 8 Å shell. Besides the memory, a tighter pocket also helps the
+    output head: it averages the pocket term over ``n_p`` atoms, so 400 mostly-distant atoms dilute
+    the ~37 real contacts tenfold, and a count that swings from 126 to 600 across complexes makes
+    that term's scale swing with it.
+
+    Residues, never individual atoms. A half-residue is off-distribution for the atom-name and
+    residue-type embeddings (a backbone N with no CA, three carbons of a phenyl ring), and ranking
+    by distance beats sampling uniformly from the 4-8 Å band, where a 7.9 Å atom would be kept
+    while a 4.1 Å one is dropped.
+
+    ``max_atoms`` is a cap, not a quota: a small buried pocket stays small rather than being padded
+    out with solvent-exposed residues. If the core alone overruns the cap its farthest residues go
+    too, so a large ligand degrades to its closest contacts instead of being dropped outright.
+
+    Randomisation goes on the *boundary*, not on individual atoms: a jittered cutoff and
+    whole-residue dropout vary the pocket's shape while leaving every kept residue intact. Dropping
+    random atoms would punch holes in the pocket wall, so the steric field the model learns from
+    would differ between epochs for the same complex.
+    """
+
+    max_atoms: int = 256
+    core_cutoff: float = 4.0  # Å, residues this close to the reference are kept first
+    cutoff: float = 6.5  # Å, shell boundary; on the examples it and the budget bind about equally often
+    cutoff_jitter: float = 1.5  # training only: cutoff ~ U[cutoff - jitter, cutoff + jitter]
+    shell_dropout: float = 0.0  # training only: chance of dropping an individual non-core residue
+
+
+def crop_pocket(item: dict, crop: PocketCrop, train: bool = False) -> dict:
+    """Narrow one cached complex's pocket to ``crop``, dropping the residue bookkeeping.
+
+    ``train=True`` enables the cutoff jitter and residue dropout; evaluation and inference use the
+    deterministic shell so a pose is reproducible.
+    """
+    dmin, res_id = item["poc_res_dmin"], item["poc_res_id"]
+    cutoff = crop.cutoff
+    if train and crop.cutoff_jitter > 0:
+        cutoff += float(torch.empty(()).uniform_(-crop.cutoff_jitter, crop.cutoff_jitter))
+    keep = dmin < max(cutoff, crop.core_cutoff)
+    if train and crop.shell_dropout > 0:
+        keep &= (dmin < crop.core_cutoff) | (torch.rand(len(dmin)) >= crop.shell_dropout)
+    # Residues are stored nearest-first, so a cumulative sum truncates the far end at the budget.
+    keep &= torch.cumsum(torch.bincount(res_id, minlength=len(dmin)) * keep, 0) <= crop.max_atoms
+    if not keep.any():
+        keep[0] = True  # never hand the model an empty pocket
+    atoms = keep[res_id]
+    out = {k: v for k, v in item.items() if k not in ("poc_res_id", "poc_res_dmin")}
+    out["poc_feat"], out["poc_pos"] = item["poc_feat"][atoms], item["poc_pos"][atoms]
+    return out
+
+
+# --------------------------------------------------------------------------------------
 # Dataset & batching
 # --------------------------------------------------------------------------------------
 class ComplexDataset(Dataset):
-    def __init__(self, cache_dir: str | Path) -> None:
+    """Cached complexes, with the pocket narrowed to ``crop`` as each one is loaded."""
+
+    def __init__(self, cache_dir: str | Path, crop: PocketCrop | None = None, train: bool = False) -> None:
         self.files = sorted(Path(cache_dir).glob("*.pt"))
         if not self.files:
             raise FileNotFoundError(f"No cached complexes in {cache_dir}")
+        self.crop = crop or PocketCrop()
+        self.train = train
 
     def __len__(self) -> int:
         return len(self.files)
 
     def __getitem__(self, idx: int) -> dict:
-        return torch.load(self.files[idx], weights_only=True)
+        return crop_pocket(torch.load(self.files[idx], weights_only=True), self.crop, self.train)
 
 
 def collate(items: list[dict]) -> dict:
@@ -115,7 +183,7 @@ def collate(items: list[dict]) -> dict:
         "poc_feat": torch.zeros(B, M, items[0]["poc_feat"].shape[1], dtype=torch.long),
         "poc_pos": torch.zeros(B, M, 3),
         "poc_mask": torch.zeros(B, M, dtype=torch.bool),
-        "ref_center": torch.stack([it["ref_center"] for it in items]),
+        "pocket_com": torch.stack([it["pocket_com"] for it in items]),
         "name": [it.get("name", "") for it in items],
     }
     for b, it in enumerate(items):
@@ -144,7 +212,13 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--ligand_glob", default="*_ligand.sdf")
     p.add_argument("--ref_glob", default="", help="reference ligand (cross-docking); default: ligand itself")
     p.add_argument("--out", required=True)
-    p.add_argument("--pocket_cutoff", type=float, default=8.0)
+    p.add_argument(
+        "--pocket_cutoff",
+        type=float,
+        default=8.0,
+        help="widest pocket shell to cache; training and docking crop it to an atom budget",
+    )
+    p.add_argument("--com_cutoff", type=float, default=6.0, help="shell whose CoM becomes the prior centre")
     p.add_argument("--max_atoms", type=int, default=128, help="skip ligands with more heavy atoms")
     p.add_argument("--workers", type=int, default=8)
     args = p.parse_args(argv)
@@ -152,7 +226,7 @@ def main(argv: list[str] | None = None) -> None:
         rows = index_from_folders(args.root, args.protein_glob, args.ligand_glob, args.ref_glob)
     else:
         rows = index_from_csv(args.csv)
-    preprocess(rows, args.out, args.pocket_cutoff, args.max_atoms, args.workers)
+    preprocess(rows, args.out, args.pocket_cutoff, args.com_cutoff, args.max_atoms, args.workers)
 
 
 if __name__ == "__main__":

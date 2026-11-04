@@ -8,11 +8,17 @@ Cross-docking / real use: define the pocket with a reference ligand or an explic
 
 Many complexes: ``--csv`` with columns protein,ligand[,ref] (paths relative to the CSV).
 Each complex writes ``<out_dir>/<name>.sdf`` with ``--num_samples`` poses (unranked).
+
+The pocket budget and the prior come from the checkpoint, so docking reproduces the pocket the
+model was trained on without having to repeat any flags. A reference ligand is the better input of
+the two: ``--center`` gives a point, and the pocket then has to be a ball around it (see
+``--center_margin``) rather than a shell wrapped around a plausible ligand.
 """
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -22,16 +28,20 @@ from rdkit.Chem import rdMolAlign
 from rdkit.Geometry import Point3D
 
 from pocketdit.chem import featurize_complex, load_ligand
-from pocketdit.data import collate, complex_name, index_from_csv, to_device
+from pocketdit.data import PocketCrop, collate, complex_name, crop_pocket, index_from_csv, to_device
 from pocketdit.flow import FlowConfig, sample
 from pocketdit.model import ModelConfig, PocketDiT
 
 
-def load_model(ckpt: str | Path, device: torch.device, use_ema: bool = True) -> tuple[PocketDiT, FlowConfig]:
+def load_model(
+    ckpt: str | Path, device: torch.device, use_ema: bool = True
+) -> tuple[PocketDiT, FlowConfig, PocketCrop]:
+    """Model plus the flow and pocket-crop settings it was trained with, so docking matches."""
     state = torch.load(ckpt, map_location=device, weights_only=True)
     model = PocketDiT(ModelConfig(**state["config"]["model"])).to(device).eval()
     model.load_state_dict(state["ema" if use_ema else "model"])
-    return model, FlowConfig(**state["config"]["flow"])
+    crop = PocketCrop(**state["config"].get("crop", {}))
+    return model, FlowConfig(**state["config"]["flow"]), crop
 
 
 def with_coords(mol: Chem.Mol, coords: np.ndarray) -> Chem.Mol:
@@ -45,6 +55,7 @@ def with_coords(mol: Chem.Mol, coords: np.ndarray) -> Chem.Mol:
 def dock(
     model: PocketDiT,
     flow: FlowConfig,
+    crop: PocketCrop,
     protein: Path,
     ligand: Path,
     ref: Path | None,
@@ -52,16 +63,23 @@ def dock(
     num_samples: int,
     num_steps: int | None,
     pocket_cutoff: float,
+    center_margin: float,
     device: torch.device,
 ) -> list[Chem.Mol]:
     mol = load_ligand(ligand)
+    explicit_center = ref is None and center is not None
     if ref is not None:
         ref_pos = load_ligand(ref).GetConformer().GetPositions()
     elif center is not None:
         ref_pos = np.asarray(center, dtype=np.float32)[None]
     else:
         ref_pos = mol.GetConformer().GetPositions()
-    item = featurize_complex(protein, mol, ref_pos, pocket_cutoff=pocket_cutoff)
+    # With an explicit centre, residue distances are measured from one point instead of from a
+    # ligand's atoms, so the whole distance scale shifts out by about a ligand radius. Widen the
+    # shell by the same margin, or the pocket comes back as a bare ball around the centre.
+    margin = center_margin if explicit_center else 0.0
+    item = featurize_complex(protein, mol, ref_pos, pocket_cutoff=pocket_cutoff + margin)
+    item = crop_pocket(item, replace(crop, cutoff=crop.cutoff + margin, core_cutoff=crop.core_cutoff + margin))
     batch = to_device(collate([item] * num_samples), device)
     poses = sample(model, batch, flow, num_steps).cpu().numpy()
     out = []
@@ -80,12 +98,19 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--protein")
     p.add_argument("--ligand")
     p.add_argument("--ref", help="reference ligand defining the pocket")
-    p.add_argument("--center", type=float, nargs=3, help="pocket centre (Å); pocket = residues within cutoff")
+    p.add_argument("--center", type=float, nargs=3, help="explicit pocket centre (Å), used as the prior centre")
     p.add_argument("--csv", help="CSV with columns protein,ligand[,ref]")
     p.add_argument("--out_dir", default="docked")
     p.add_argument("--num_samples", type=int, default=10)
     p.add_argument("--num_steps", type=int, default=None, help="default: value stored in the checkpoint")
-    p.add_argument("--pocket_cutoff", type=float, default=8.0, help="must match preprocessing")
+    p.add_argument("--pocket_cutoff", type=float, default=8.0, help="widest shell considered before cropping")
+    p.add_argument("--max_pocket_atoms", type=int, default=None, help="default: the trained value")
+    p.add_argument(
+        "--center_margin",
+        type=float,
+        default=6.0,
+        help="with --center, how far past the shell to reach (roughly a ligand radius)",
+    )
     p.add_argument("--no_ema", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -93,7 +118,9 @@ def main(argv: list[str] | None = None) -> None:
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
-    model, flow = load_model(args.ckpt, device, use_ema=not args.no_ema)
+    model, flow, crop = load_model(args.ckpt, device, use_ema=not args.no_ema)
+    if args.max_pocket_atoms is not None:
+        crop = replace(crop, max_atoms=args.max_pocket_atoms)
     if args.csv:
         rows = index_from_csv(args.csv)
     elif args.protein and args.ligand:
@@ -104,7 +131,18 @@ def main(argv: list[str] | None = None) -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     for row in rows:
-        poses = dock(model, flow, *row, args.center, args.num_samples, args.num_steps, args.pocket_cutoff, device)
+        poses = dock(
+            model,
+            flow,
+            crop,
+            *row,
+            center=args.center,
+            num_samples=args.num_samples,
+            num_steps=args.num_steps,
+            pocket_cutoff=args.pocket_cutoff,
+            center_margin=args.center_margin,
+            device=device,
+        )
         with Chem.SDWriter(str(out_dir / f"{complex_name(row)}.sdf")) as w:
             for pose in poses:
                 w.write(pose)

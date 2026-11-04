@@ -20,8 +20,8 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from pocketdit.data import ComplexDataset, collate, to_device
-from pocketdit.flow import FlowConfig, flow_matching_loss, rmsd, sample
+from pocketdit.data import ComplexDataset, PocketCrop, collate, to_device
+from pocketdit.flow import FlowConfig, centroid_error, flow_matching_loss, rmsd, sample
 from pocketdit.model import ModelConfig, PocketDiT
 
 
@@ -49,6 +49,7 @@ class TrainConfig:
     save_every: int = 5000
     model: ModelConfig = field(default_factory=ModelConfig)
     flow: FlowConfig = field(default_factory=FlowConfig)
+    crop: PocketCrop = field(default_factory=PocketCrop)
 
 
 def parse_config(argv: list[str] | None = None) -> TrainConfig:
@@ -96,7 +97,7 @@ def ema_update(ema: torch.nn.Module, model: torch.nn.Module, decay: float) -> No
 @torch.no_grad()
 def validate(model: PocketDiT, loader: DataLoader, cfg: TrainConfig, device: torch.device) -> dict[str, float]:
     model.eval()
-    losses, rmsds = [], []
+    losses, rmsds, centroids = [], [], []
     for batch in loader:
         batch = to_device(batch, device)
         with autocast(cfg, device):
@@ -105,11 +106,14 @@ def validate(model: PocketDiT, loader: DataLoader, cfg: TrainConfig, device: tor
             if len(rmsds) < cfg.val_num_sampled:
                 x = sample(model, batch, cfg.flow)
                 rmsds.extend(rmsd(x, batch["lig_pos"], batch["lig_mask"]).tolist())
+                centroids.extend(centroid_error(x, batch["lig_pos"], batch["lig_mask"]).tolist())
     model.train()
     out = {"val/loss": sum(losses) / len(losses)}
     if rmsds:
-        r = torch.tensor(rmsds)
+        r, c = torch.tensor(rmsds), torch.tensor(centroids)
         out.update({"val/rmsd_median": r.median().item(), "val/rmsd<2A": (r < 2.0).float().mean().item()})
+        # Compare against the same number on a cross-docked set: see flow.centroid_error.
+        out["val/centroid_err_median"] = c.median().item()
     return out
 
 
@@ -140,12 +144,14 @@ def main(argv: list[str] | None = None) -> None:
     (out_dir / "config.json").write_text(json.dumps(asdict(cfg), indent=2))
 
     loader_kw = {"collate_fn": collate, "num_workers": cfg.num_workers, "persistent_workers": cfg.num_workers > 0}
-    train_ds = ComplexDataset(cfg.train_dir)
+    train_ds = ComplexDataset(cfg.train_dir, cfg.crop, train=True)
     batch_size = min(cfg.batch_size, len(train_ds))
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True, **loader_kw)
     val_loader = None
     if cfg.val_dir:
-        val_loader = DataLoader(ComplexDataset(cfg.val_dir), batch_size=cfg.batch_size, **loader_kw)
+        # train=False: the deterministic shell, so validation numbers are comparable across steps.
+        val_ds = ComplexDataset(cfg.val_dir, cfg.crop, train=False)
+        val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, **loader_kw)
 
     model = PocketDiT(cfg.model).to(device)
     ema = copy.deepcopy(model).requires_grad_(False)
