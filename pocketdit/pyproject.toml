@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pocketdit"
+version = "0.1.0"
+description = "Pocket-conditioned Diffusion Transformer with flow matching for molecular docking"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.1", "numpy", "rdkit"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+pocketdit-preprocess = "pocketdit.data:main"
+pocketdit-train = "pocketdit.train:main"
+pocketdit-dock = "pocketdit.dock:main"
+
+[tool.setuptools.packages.find]
+include = ["pocketdit*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["pocketdit", "conftest"]
