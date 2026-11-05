@@ -63,11 +63,36 @@ def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser()
     p.add_argument("csv", nargs="+", type=Path)
     p.add_argument("--top", type=int, default=15, help="how many worst molecules to list")
+    p.add_argument("--max-atoms", type=int, help="drop ligands with more heavy atoms, as preprocessing does")
+    p.add_argument("--max-torsions", type=int, help="drop ligands with more rotatable bonds")
     args = p.parse_args(argv)
 
     rows = load(args.csv)
     if not rows:
         sys.exit("no rows")
+
+    # The aggregate over the whole set is not what training sees: preprocessing drops the large
+    # and the very flexible ligands, and those are exactly where the fragment count and the
+    # degenerate share are worst. Pass the same limits here for the numbers that describe the
+    # training set rather than the dataset.
+    if args.max_atoms or args.max_torsions:
+        before = len(rows)
+        rows = [
+            r
+            for r in rows
+            if (args.max_atoms is None or r["atoms"] <= args.max_atoms)
+            and (args.max_torsions is None or r["torsions"] <= args.max_torsions)
+        ]
+        if not rows:
+            sys.exit("every ligand was filtered out")
+        limits = []
+        if args.max_atoms:
+            limits.append(f"atoms <= {args.max_atoms}")
+        if args.max_torsions:
+            limits.append(f"torsions <= {args.max_torsions}")
+        dropped = before - len(rows)
+        kept = f"kept {len(rows)} of {before}, dropped {dropped} ({pct(dropped, before)})"
+        print(f"filter: {', '.join(limits)}  ->  {kept}")
 
     n_mol = len(rows)
     total_frags = sum(r["fragments"] for r in rows)

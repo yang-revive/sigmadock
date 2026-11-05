@@ -197,7 +197,7 @@ python -m pocketdit.fragment --smiles "CCc1ccccc1" "COc1ccccc1"   # 快速查看
 
 `ignore_conjugated=True` 会再砍掉 14.1% 的扭转键（每条分子平均 1.47 条），把切口占比推到 69.0%。
 
-复现：`python scripts/fragment_sweep.py --root <...> --out sweep.csv` 再 `python scripts/analyze_sweep.py sweep.csv`；单分子为什么被切可以看 `python scripts/diagnose_merge.py --root <...> --name 2rqu`。
+复现：`python scripts/fragment_sweep.py --root <...> --out sweep.csv` 再 `python scripts/analyze_sweep.py sweep.csv`。加 `--max-atoms 128 --max-torsions 20` 可以得到**过滤后**（即训练集真正会看到的）的同一组数字，不必重跑 sweep；单分子为什么被切可以看 `python scripts/diagnose_merge.py --root <...> --name 2rqu`。
 
 ## 已知局限和下一步
 
