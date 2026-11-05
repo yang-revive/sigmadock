@@ -111,38 +111,105 @@ class PocketCrop:
     out with solvent-exposed residues. If the core alone overruns the cap its farthest residues go
     too, so a large ligand degrades to its closest contacts instead of being dropped outright.
 
-    Randomisation goes on the *boundary*, not on individual atoms: a jittered cutoff and
-    whole-residue dropout vary the pocket's shape while leaving every kept residue intact. Dropping
-    random atoms would punch holes in the pocket wall, so the steric field the model learns from
-    would differ between epochs for the same complex.
+    Randomisation goes on the *boundary*, not on individual atoms: the shell is re-selected against
+    a rigidly displaced copy of the reference, the cutoff is jittered, and whole residues may be
+    dropped -- but every residue that is kept is kept whole. Dropping random atoms would punch
+    holes in the pocket wall, so the steric field the model learns from would differ between epochs
+    for the same complex.
+
+    ``dir_noise`` is the important one. The shell selected against the undisplaced reference traces
+    the ligand's outline at ~1 Å, which the model can read the answer off. Displacing the reference
+    by a few Å in a random direction destroys that fine outline while leaving the coarse groove
+    shape -- the part that is a genuine property of the protein -- intact. It is the *maximum*
+    displacement, drawn as |u| ~ U[0, dir_noise], so the model sees pocket definitions ranging from
+    near-perfect to poor; the mean displacement is half of it. Measured on the ten example
+    complexes, as the share of selected residues that differ from the undisplaced selection and the
+    distance from the pocket's centroid to the ligand's:
+
+        dir_noise  0 -> 0%, 2.21 Å    2 -> 17%, 2.47 Å    4 -> 31%, 3.05 Å
+
+    The atom count stays at 237-241 throughout, so the budget is unaffected.
+
+    It also stands in for cross-docking: at inference the shell comes from a reference ligand whose
+    atoms sit a few Å from the query's true pose, which is exactly what a displaced reference is.
+    So this buys the cross-docking input distribution without needing cross-docked data.
+
+    What it does not fix is the shell's *elongation axis*, which a rigid displacement preserves
+    (principal-axis angle to the ligand stays around 28-33 deg). That is mostly fine: a binding
+    site is a groove and the ligand lies along it, so the groove's direction is a property of the
+    protein, not a leak from the answer.
+
+    The contact core is left undisplaced on purpose: those residues are the signal, and what they
+    give away -- the ligand's gross position, blurred by a 4 Å dilation -- is the pocket location,
+    which is a legitimate input to the task and is handed to the model as ``pocket_com`` anyway.
     """
 
     max_atoms: int = 256
     core_cutoff: float = 4.0  # Å, residues this close to the reference are kept first
     cutoff: float = 6.5  # Å, shell boundary; on the examples it and the budget bind about equally often
+    dir_noise: float = 4.0  # Å, training only: rigid displacement of the reference, |u| ~ U[0, dir_noise]
     cutoff_jitter: float = 1.5  # training only: cutoff ~ U[cutoff - jitter, cutoff + jitter]
     shell_dropout: float = 0.0  # training only: chance of dropping an individual non-core residue
 
+    def cache_cutoff_needed(self) -> float:
+        """Cache radius this crop can actually reach into (see ``ComplexDataset``)."""
+        return self.cutoff + self.cutoff_jitter + self.dir_noise
+
+
+DROPPED_BY_CROP = ("poc_res_id", "poc_res_dmin", "ref_pos", "poc_cache_cutoff")
+
+
+def _residue_distance(poc_pos: torch.Tensor, ref: torch.Tensor, res_id: torch.Tensor, n_res: int) -> torch.Tensor:
+    """Per-residue distance to the nearest point of ``ref``: [n_res], inf where a residue is absent."""
+    d = (poc_pos[:, None] - ref[None]).norm(dim=-1).min(dim=1).values
+    out = torch.full((n_res,), float("inf"))
+    return out.scatter_reduce_(0, res_id, d, reduce="amin", include_self=True)
+
 
 def crop_pocket(item: dict, crop: PocketCrop, train: bool = False) -> dict:
-    """Narrow one cached complex's pocket to ``crop``, dropping the residue bookkeeping.
+    """Narrow one cached complex's pocket to ``crop``, dropping the selection bookkeeping.
 
-    ``train=True`` enables the cutoff jitter and residue dropout; evaluation and inference use the
-    deterministic shell so a pose is reproducible.
+    The contact core -- residues within ``core_cutoff`` of the undisplaced reference -- is always
+    kept and always ranked first, because those are the residues that determine the pose. The shell
+    around it is re-selected against a displaced reference and fills whatever budget is left,
+    nearest-first.
+
+    ``train=True`` enables the displacement, cutoff jitter and residue dropout; evaluation and
+    inference select against the undisplaced reference so a pose is reproducible.
     """
     dmin, res_id = item["poc_res_dmin"], item["poc_res_id"]
-    cutoff = crop.cutoff
-    if train and crop.cutoff_jitter > 0:
-        cutoff += float(torch.empty(()).uniform_(-crop.cutoff_jitter, crop.cutoff_jitter))
-    keep = dmin < max(cutoff, crop.core_cutoff)
+    n_res = len(dmin)
+    core = dmin < crop.core_cutoff
+
+    cutoff, shell = crop.cutoff, dmin
+    if train:
+        if crop.cutoff_jitter > 0:
+            cutoff += float(torch.empty(()).uniform_(-crop.cutoff_jitter, crop.cutoff_jitter))
+        if crop.dir_noise > 0:
+            # One rigid displacement of the whole reference: a random direction, magnitude uniform
+            # in [0, dir_noise] so the model sees both near-perfect and poor pocket definitions.
+            u = torch.randn(3)
+            u *= float(torch.rand(())) * crop.dir_noise / u.norm().clamp(min=1e-6)
+            shell = _residue_distance(item["poc_pos"], item["ref_pos"] + u, res_id, n_res)
+
+    keep = core | (shell < cutoff)
     if train and crop.shell_dropout > 0:
-        keep &= (dmin < crop.core_cutoff) | (torch.rand(len(dmin)) >= crop.shell_dropout)
-    # Residues are stored nearest-first, so a cumulative sum truncates the far end at the budget.
-    keep &= torch.cumsum(torch.bincount(res_id, minlength=len(dmin)) * keep, 0) <= crop.max_atoms
+        keep &= core | (torch.rand(n_res) >= crop.shell_dropout)
     if not keep.any():
-        keep[0] = True  # never hand the model an empty pocket
-    atoms = keep[res_id]
-    out = {k: v for k, v in item.items() if k not in ("poc_res_id", "poc_res_dmin")}
+        keep[dmin.argmin()] = True  # never hand the model an empty pocket
+
+    # Core first by true distance, then the shell by displaced distance; the budget truncates the
+    # far end. Residues that were not kept sort last and are removed by the isfinite mask.
+    key = torch.where(core, dmin, shell + 1e3)
+    key = torch.where(keep, key, torch.tensor(float("inf")))
+    order = key.argsort()
+    sizes = torch.bincount(res_id, minlength=n_res)[order]
+    take = order[(torch.cumsum(sizes, 0) <= crop.max_atoms) & key[order].isfinite()]
+    if len(take) == 0:
+        take = order[:1]  # a single residue larger than the whole budget
+
+    atoms = torch.isin(res_id, take)
+    out = {k: v for k, v in item.items() if k not in DROPPED_BY_CROP}
     out["poc_feat"], out["poc_pos"] = item["poc_feat"][atoms], item["poc_pos"][atoms]
     return out
 
@@ -159,6 +226,18 @@ class ComplexDataset(Dataset):
             raise FileNotFoundError(f"No cached complexes in {cache_dir}")
         self.crop = crop or PocketCrop()
         self.train = train
+        # The crop can only select residues the cache holds, so a displaced shell that reaches past
+        # the cache radius would be silently clipped on that side -- which is the one thing the
+        # displacement is supposed to avoid. Check once rather than let it pass unnoticed.
+        cached = float(torch.load(self.files[0], weights_only=True)["poc_cache_cutoff"])
+        needed = self.crop.cache_cutoff_needed()
+        if train and needed > cached + 1e-6:
+            raise ValueError(
+                f"{cache_dir} was cached with pocket_cutoff={cached:g} Å but this crop reaches "
+                f"{needed:g} Å (cutoff {self.crop.cutoff:g} + jitter {self.crop.cutoff_jitter:g} + "
+                f"dir_noise {self.crop.dir_noise:g}). Re-run pocketdit.data with "
+                f"--pocket_cutoff {needed:g} or larger, or lower the crop."
+            )
 
     def __len__(self) -> int:
         return len(self.files)
@@ -215,8 +294,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument(
         "--pocket_cutoff",
         type=float,
-        default=8.0,
-        help="widest pocket shell to cache; training and docking crop it to an atom budget",
+        default=12.0,
+        help="widest shell to cache; must cover crop.cutoff + cutoff_jitter + dir_noise (default 10)",
     )
     p.add_argument("--com_cutoff", type=float, default=6.0, help="shell whose CoM becomes the prior centre")
     p.add_argument("--max_atoms", type=int, default=128, help="skip ligands with more heavy atoms")

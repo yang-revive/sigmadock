@@ -223,9 +223,12 @@ def featurize_pocket(
     """All heavy atoms of every residue with an atom within ``cutoff`` Å of the reference.
 
     Atoms come out grouped by residue, with the residues ordered by their distance to the
-    reference; ``poc_res_id`` and ``poc_res_dmin`` record that grouping. A distance-ranked prefix
-    of whole residues is therefore a valid smaller pocket, which is exactly what
-    ``data.crop_pocket`` keeps when it narrows this to a budget.
+    reference; ``poc_res_id`` and ``poc_res_dmin`` record that grouping, and ``data.crop_pocket``
+    uses them to narrow this to a budget when a complex is loaded.
+
+    ``cutoff`` here is the *cache* radius, deliberately wider than the pocket that will be trained
+    on, because the crop re-selects the shell against a randomly displaced reference and a residue
+    that enters only under that displacement has to be in the cache to be selectable at all.
     """
     dist = _min_dist(protein, ref_pos) if dist is None else dist
     uniq, inv = np.unique(protein["resid"], return_inverse=True)
@@ -263,7 +266,7 @@ def featurize_complex(
     protein_pdb: str | Path,
     ligand: Chem.Mol,
     ref_pos: np.ndarray,
-    pocket_cutoff: float = 8.0,
+    pocket_cutoff: float = 12.0,
     com_cutoff: float = 6.0,
 ) -> dict[str, torch.Tensor]:
     """Ligand + pocket features. ``ref_pos`` (Å) defines the pocket and the prior centre.
@@ -271,7 +274,8 @@ def featurize_complex(
     Re-docking: ``ref_pos`` is the ligand's own crystal pose. Cross-docking: a reference ligand, or
     a single point for an explicit pocket centre. ``pocket_cutoff`` is the *widest* shell ever
     needed: the pocket is narrowed to an atom budget by ``data.crop_pocket`` when a complex is
-    loaded, so cache once at 8 Å and crop afterwards.
+    loaded, so cache once with headroom and crop afterwards. ``ref_pos`` is kept in the item
+    because the crop re-selects the shell against a displaced copy of it.
     """
     ref_pos = np.asarray(ref_pos, dtype=np.float32).reshape(-1, 3)
     protein = read_pdb(protein_pdb)
@@ -279,4 +283,6 @@ def featurize_complex(
     out = featurize_ligand(ligand)
     out.update(featurize_pocket(protein, ref_pos, pocket_cutoff, dist))
     out["pocket_com"] = torch.from_numpy(pocket_center(protein, ref_pos, com_cutoff, dist))
+    out["ref_pos"] = torch.from_numpy(ref_pos)
+    out["poc_cache_cutoff"] = torch.tensor(float(pocket_cutoff))
     return out
