@@ -103,7 +103,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--out_dir", default="docked")
     p.add_argument("--num_samples", type=int, default=10)
     p.add_argument("--num_steps", type=int, default=None, help="default: value stored in the checkpoint")
-    p.add_argument("--pocket_cutoff", type=float, default=12.0, help="widest shell considered before cropping")
+    p.add_argument("--pocket_cutoff", type=float, default=15.0, help="widest shell considered before cropping")
     p.add_argument("--max_pocket_atoms", type=int, default=None, help="default: the trained value")
     p.add_argument(
         "--center_margin",

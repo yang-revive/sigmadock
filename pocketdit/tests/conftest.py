@@ -10,7 +10,7 @@ from pocketdit.model import ModelConfig, PocketDiT
 DUMMY = Path(__file__).resolve().parents[2] / "notebooks" / "dummy_data"
 
 
-def load_item(name: str, pocket_cutoff: float = 12.0, crop: PocketCrop | None = None, train: bool = False) -> dict:
+def load_item(name: str, pocket_cutoff: float = 15.0, crop: PocketCrop | None = None, train: bool = False) -> dict:
     """One cached-and-cropped complex, i.e. exactly what the dataset hands the model."""
     folder = DUMMY / name
     mol = load_ligand(next(folder.glob("*_ligand.sdf")))
@@ -19,7 +19,7 @@ def load_item(name: str, pocket_cutoff: float = 12.0, crop: PocketCrop | None = 
     return crop_pocket(item, crop or PocketCrop(), train=train)
 
 
-def load_uncropped(name: str, pocket_cutoff: float = 12.0) -> dict:
+def load_uncropped(name: str, pocket_cutoff: float = 15.0) -> dict:
     """The cache entry before cropping, with the ``poc_res_*`` bookkeeping still attached."""
     folder = DUMMY / name
     mol = load_ligand(next(folder.glob("*_ligand.sdf")))

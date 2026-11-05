@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 from dataclasses import dataclass
 from multiprocessing import Pool
 from pathlib import Path
@@ -117,29 +118,44 @@ class PocketCrop:
     holes in the pocket wall, so the steric field the model learns from would differ between epochs
     for the same complex.
 
-    ``dir_noise`` is the important one. The shell selected against the undisplaced reference traces
-    the ligand's outline at ~1 Å, which the model can read the answer off. Displacing the reference
-    by a few Å in a random direction destroys that fine outline while leaving the coarse groove
-    shape -- the part that is a genuine property of the protein -- intact. It is the *maximum*
-    displacement, drawn as |u| ~ U[0, dir_noise], so the model sees pocket definitions ranging from
-    near-perfect to poor; the mean displacement is half of it. Measured on the ten example
-    complexes, as the share of selected residues that differ from the undisplaced selection and the
-    distance from the pocket's centroid to the ligand's:
+    ``dir_noise`` and ``rot_noise`` are the important ones. The shell selected against the
+    untouched reference traces the ligand's outline at ~1 Å, which the model can read the answer
+    off. So the shell is selected against a copy of the reference that is rotated about its own
+    centroid by theta ~ U[0, rot_noise] and then displaced by |u| ~ U[0, dir_noise] in a uniformly
+    random direction. Both are *maxima*, not fixed amounts, so the model sees pocket definitions
+    ranging from near-perfect to poor; the mean perturbation is about half of each.
 
-        dir_noise  0 -> 0%, 2.21 Å    2 -> 17%, 2.47 Å    4 -> 31%, 3.05 Å
+    They break different things, which is why both are here. Over the ten example complexes, 30
+    draws each -- the share of selected residues that differ from the untouched selection, the
+    share of the true 6.5 Å shell still selected, the distance from the pocket's centroid to the
+    ligand's, and the principal-axis angle between pocket and ligand:
 
-    The atom count stays at 237-241 throughout, so the budget is unaffected.
+        untouched            237 atoms    0%    97%    2.21 Å    28 deg
+        displace 2 Å         239 atoms   16%    91%    2.44 Å    30 deg
+        displace 4 Å         242 atoms   30%    85%    3.03 Å    31 deg
+        rotate 30 deg        240 atoms   15%    92%    2.11 Å    32 deg
+        rotate 60 deg        243 atoms   26%    87%    2.05 Å    39 deg
+        default 2 Å + 30 deg 242 atoms   24%    88%    2.29 Å    34 deg
 
-    It also stands in for cross-docking: at inference the shell comes from a reference ligand whose
-    atoms sit a few Å from the query's true pose, which is exactly what a displaced reference is.
-    So this buys the cross-docking input distribution without needing cross-docked data.
+    A displacement moves the pocket off the ligand (2.21 -> 3.03 Å) and on average barely turns it
+    (28 -> 31 deg); a rotation turns it (28 -> 39 deg) and, being about the reference's own
+    centroid, does not move it at all. The atom count stays at 237-243 throughout, so neither
+    disturbs the budget. The axis figures are population averages with a wide spread -- a small,
+    well-aligned ligand in a tight pocket can have its axis moved a long way by a displacement too.
 
-    What it does not fix is the shell's *elongation axis*, which a rigid displacement preserves
-    (principal-axis angle to the ligand stays around 28-33 deg). That is mostly fine: a binding
-    site is a groove and the ligand lies along it, so the groove's direction is a property of the
-    protein, not a leak from the answer.
+    Both also stand in for cross-docking: at inference the shell comes from a reference ligand that
+    sits a few Å and a few tens of degrees off the query's true pose, which is exactly what a
+    rotated, displaced reference is. So this buys the cross-docking input distribution without
+    needing cross-docked data -- and that is also what bounds ``rot_noise``. A reference ligand
+    binds *along the groove*, so at inference the angle is small, not uniform. Two ligands sharing a
+    groove differ by roughly 20-40 deg, hence the 30 deg default. Going further is not more
+    realistic, it is off-distribution in the wrong direction, and it costs: a reference rotated by
+    90 deg has 47% of its atoms buried within 2.5 Å of a protein heavy atom, so the shell around it
+    is protein interior and a quarter of the genuine pocket lining is crowded out. (For the record,
+    180 deg decorrelates *less* than 90 deg -- rotating an elongated ligand by 180 deg about a
+    perpendicular axis roughly maps it onto itself.)
 
-    The contact core is left undisplaced on purpose: those residues are the signal, and what they
+    The contact core is left untouched on purpose: those residues are the signal, and what they
     give away -- the ligand's gross position, blurred by a 4 Å dilation -- is the pocket location,
     which is a legitimate input to the task and is handed to the model as ``pocket_com`` anyway.
     """
@@ -147,16 +163,23 @@ class PocketCrop:
     max_atoms: int = 256
     core_cutoff: float = 4.0  # Å, residues this close to the reference are kept first
     cutoff: float = 6.5  # Å, shell boundary; on the examples it and the budget bind about equally often
-    dir_noise: float = 4.0  # Å, training only: rigid displacement of the reference, |u| ~ U[0, dir_noise]
+    dir_noise: float = 2.0  # Å, training only: displacement of the reference, |u| ~ U[0, dir_noise]
+    rot_noise: float = 30.0  # degrees, training only: rotation about its centroid, theta ~ U[0, rot_noise]
     cutoff_jitter: float = 1.5  # training only: cutoff ~ U[cutoff - jitter, cutoff + jitter]
     shell_dropout: float = 0.0  # training only: chance of dropping an individual non-core residue
 
-    def cache_cutoff_needed(self) -> float:
-        """Cache radius this crop can actually reach into (see ``ComplexDataset``)."""
-        return self.cutoff + self.cutoff_jitter + self.dir_noise
+    def cache_cutoff_needed(self, ref_radius: float) -> float:
+        """Cache radius this crop can reach into for a reference of this extent.
+
+        A rotation about the centroid moves an atom ``ref_radius`` out by up to
+        ``2 sin(theta/2) * ref_radius``, so unlike the other knobs this one scales with the
+        reference. See ``ComplexDataset`` for why reaching past the cache is refused.
+        """
+        swing = 2 * math.sin(math.radians(self.rot_noise) / 2) * ref_radius
+        return self.cutoff + self.cutoff_jitter + self.dir_noise + swing
 
 
-DROPPED_BY_CROP = ("poc_res_id", "poc_res_dmin", "ref_pos", "poc_cache_cutoff")
+DROPPED_BY_CROP = ("poc_res_id", "poc_res_dmin", "ref_pos", "ref_radius", "poc_cache_cutoff")
 
 
 def _residue_distance(poc_pos: torch.Tensor, ref: torch.Tensor, res_id: torch.Tensor, n_res: int) -> torch.Tensor:
@@ -166,16 +189,58 @@ def _residue_distance(poc_pos: torch.Tensor, ref: torch.Tensor, res_id: torch.Te
     return out.scatter_reduce_(0, res_id, d, reduce="amin", include_self=True)
 
 
+def _random_rotation(max_angle_deg: float) -> torch.Tensor:
+    """Rotation by theta ~ U[0, max_angle_deg] about a uniformly random axis (Rodrigues)."""
+    axis = torch.randn(3)
+    a = axis / axis.norm().clamp(min=1e-6)
+    theta = torch.rand(()) * math.radians(max_angle_deg)
+    k = torch.zeros(3, 3)
+    k[0, 1], k[0, 2] = -a[2], a[1]
+    k[1, 0], k[1, 2] = a[2], -a[0]
+    k[2, 0], k[2, 1] = -a[1], a[0]
+    return torch.eye(3) + theta.sin() * k + (1 - theta.cos()) * (k @ k)
+
+
+def perturb_reference(ref: torch.Tensor, crop: PocketCrop) -> torch.Tensor:
+    """A rotated and displaced copy of the selection reference: a stand-in reference ligand.
+
+    Rotation is about the reference's own centroid, so it stays in the pocket and only its
+    orientation changes; the displacement then moves it bodily. A single-point reference (an
+    explicit pocket centre) is unaffected by the rotation, as it should be.
+    """
+    if crop.rot_noise > 0 and len(ref) > 1:
+        center = ref.mean(0)
+        ref = (ref - center) @ _random_rotation(crop.rot_noise).T + center
+    if crop.dir_noise > 0:
+        u = torch.randn(3)
+        ref = ref + u * (float(torch.rand(())) * crop.dir_noise / u.norm().clamp(min=1e-6))
+    return ref
+
+
+def _check_cache_headroom(item: dict, crop: PocketCrop) -> None:
+    """Refuse a cache the perturbed reference would reach past (see ``ComplexDataset``)."""
+    cached, radius = float(item["poc_cache_cutoff"]), float(item["ref_radius"])
+    needed = crop.cache_cutoff_needed(radius)
+    if needed > cached + 1e-6:
+        raise ValueError(
+            f"complex {item.get('name', '?')!r} was cached with pocket_cutoff={cached:g} Å but this "
+            f"crop reaches {needed:g} Å for a reference of radius {radius:.1f} Å (cutoff "
+            f"{crop.cutoff:g} + jitter {crop.cutoff_jitter:g} + dir_noise {crop.dir_noise:g} + "
+            f"{crop.rot_noise:g}° swing). Re-run pocketdit.data with --pocket_cutoff {needed:g} or "
+            f"larger, or lower the crop."
+        )
+
+
 def crop_pocket(item: dict, crop: PocketCrop, train: bool = False) -> dict:
     """Narrow one cached complex's pocket to ``crop``, dropping the selection bookkeeping.
 
-    The contact core -- residues within ``core_cutoff`` of the undisplaced reference -- is always
+    The contact core -- residues within ``core_cutoff`` of the untouched reference -- is always
     kept and always ranked first, because those are the residues that determine the pose. The shell
-    around it is re-selected against a displaced reference and fills whatever budget is left,
-    nearest-first.
+    around it is re-selected against a rotated and displaced reference and fills whatever budget is
+    left, nearest-first.
 
-    ``train=True`` enables the displacement, cutoff jitter and residue dropout; evaluation and
-    inference select against the undisplaced reference so a pose is reproducible.
+    ``train=True`` enables the perturbation, cutoff jitter and residue dropout; evaluation and
+    inference select against the untouched reference so a pose is reproducible.
     """
     dmin, res_id = item["poc_res_dmin"], item["poc_res_id"]
     n_res = len(dmin)
@@ -185,12 +250,10 @@ def crop_pocket(item: dict, crop: PocketCrop, train: bool = False) -> dict:
     if train:
         if crop.cutoff_jitter > 0:
             cutoff += float(torch.empty(()).uniform_(-crop.cutoff_jitter, crop.cutoff_jitter))
-        if crop.dir_noise > 0:
-            # One rigid displacement of the whole reference: a random direction, magnitude uniform
-            # in [0, dir_noise] so the model sees both near-perfect and poor pocket definitions.
-            u = torch.randn(3)
-            u *= float(torch.rand(())) * crop.dir_noise / u.norm().clamp(min=1e-6)
-            shell = _residue_distance(item["poc_pos"], item["ref_pos"] + u, res_id, n_res)
+        if crop.dir_noise > 0 or crop.rot_noise > 0:
+            _check_cache_headroom(item, crop)
+            ref = perturb_reference(item["ref_pos"], crop)
+            shell = _residue_distance(item["poc_pos"], ref, res_id, n_res)
 
     keep = core | (shell < cutoff)
     if train and crop.shell_dropout > 0:
@@ -226,18 +289,13 @@ class ComplexDataset(Dataset):
             raise FileNotFoundError(f"No cached complexes in {cache_dir}")
         self.crop = crop or PocketCrop()
         self.train = train
-        # The crop can only select residues the cache holds, so a displaced shell that reaches past
-        # the cache radius would be silently clipped on that side -- which is the one thing the
-        # displacement is supposed to avoid. Check once rather than let it pass unnoticed.
-        cached = float(torch.load(self.files[0], weights_only=True)["poc_cache_cutoff"])
-        needed = self.crop.cache_cutoff_needed()
-        if train and needed > cached + 1e-6:
-            raise ValueError(
-                f"{cache_dir} was cached with pocket_cutoff={cached:g} Å but this crop reaches "
-                f"{needed:g} Å (cutoff {self.crop.cutoff:g} + jitter {self.crop.cutoff_jitter:g} + "
-                f"dir_noise {self.crop.dir_noise:g}). Re-run pocketdit.data with "
-                f"--pocket_cutoff {needed:g} or larger, or lower the crop."
-            )
+        # The crop can only select residues the cache holds, so a perturbed shell reaching past the
+        # cache radius would be silently clipped on that side -- which is the one thing the
+        # perturbation is supposed to avoid. How far it reaches scales with the reference's own
+        # extent, so every complex is checked as it is loaded; this is the early warning for the
+        # common case of a cache that is simply too narrow for the configured crop.
+        if train:
+            _check_cache_headroom(torch.load(self.files[0], weights_only=True), self.crop)
 
     def __len__(self) -> int:
         return len(self.files)
@@ -294,8 +352,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument(
         "--pocket_cutoff",
         type=float,
-        default=12.0,
-        help="widest shell to cache; must cover crop.cutoff + cutoff_jitter + dir_noise (default 10)",
+        default=15.0,
+        help="widest shell to cache; must cover PocketCrop.cache_cutoff_needed() for every complex",
     )
     p.add_argument("--com_cutoff", type=float, default=6.0, help="shell whose CoM becomes the prior centre")
     p.add_argument("--max_atoms", type=int, default=128, help="skip ligands with more heavy atoms")

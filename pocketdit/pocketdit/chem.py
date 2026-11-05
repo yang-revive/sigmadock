@@ -266,7 +266,7 @@ def featurize_complex(
     protein_pdb: str | Path,
     ligand: Chem.Mol,
     ref_pos: np.ndarray,
-    pocket_cutoff: float = 12.0,
+    pocket_cutoff: float = 15.0,
     com_cutoff: float = 6.0,
 ) -> dict[str, torch.Tensor]:
     """Ligand + pocket features. ``ref_pos`` (Å) defines the pocket and the prior centre.
@@ -274,8 +274,9 @@ def featurize_complex(
     Re-docking: ``ref_pos`` is the ligand's own crystal pose. Cross-docking: a reference ligand, or
     a single point for an explicit pocket centre. ``pocket_cutoff`` is the *widest* shell ever
     needed: the pocket is narrowed to an atom budget by ``data.crop_pocket`` when a complex is
-    loaded, so cache once with headroom and crop afterwards. ``ref_pos`` is kept in the item
-    because the crop re-selects the shell against a displaced copy of it.
+    loaded, so cache once with headroom and crop afterwards. ``ref_pos`` and ``ref_radius`` are
+    kept in the item because the crop re-selects the shell against a rotated and displaced copy of
+    the reference, and how far that copy can reach depends on the reference's own extent.
     """
     ref_pos = np.asarray(ref_pos, dtype=np.float32).reshape(-1, 3)
     protein = read_pdb(protein_pdb)
@@ -284,5 +285,6 @@ def featurize_complex(
     out.update(featurize_pocket(protein, ref_pos, pocket_cutoff, dist))
     out["pocket_com"] = torch.from_numpy(pocket_center(protein, ref_pos, com_cutoff, dist))
     out["ref_pos"] = torch.from_numpy(ref_pos)
+    out["ref_radius"] = torch.tensor(float(np.linalg.norm(ref_pos - ref_pos.mean(0), axis=1).max()))
     out["poc_cache_cutoff"] = torch.tensor(float(pocket_cutoff))
     return out
