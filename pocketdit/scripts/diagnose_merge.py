@@ -46,20 +46,28 @@ def diagnose(path: Path) -> None:
     end_list = [ends[b] for b in bonds]
     sizes = frag.sizes
 
-    print(f"{path.parent.name}: {mol.GetNumAtoms()} heavy atoms, {len(bonds)} torsions, "
-          f"{frag.num_fragments} fragments, sizes {sorted(sizes.tolist())}")
+    print(
+        f"{path.parent.name}: {mol.GetNumAtoms()} heavy atoms, {len(bonds)} torsions, "
+        f"{frag.num_fragments} fragments, sizes {sorted(sizes.tolist())}"
+    )
     small = int((frag.sizes <= 2).sum())
     print(f"  fragments with <= 2 atoms: {small}")
 
     hard = [b for b in bonds if mol.GetAtomWithIdx(ends[b][0]).IsInRing() and mol.GetAtomWithIdx(ends[b][1]).IsInRing()]
-    merged_deg = [b for b in bonds if not (mol.GetAtomWithIdx(ends[b][0]).IsInRing()
-                                           and mol.GetAtomWithIdx(ends[b][1]).IsInRing())
-                  and deg[ends[b][0]] == 1 and deg[ends[b][1]] == 1]
+    merged_deg = [
+        b
+        for b in bonds
+        if not (mol.GetAtomWithIdx(ends[b][0]).IsInRing() and mol.GetAtomWithIdx(ends[b][1]).IsInRing())
+        and deg[ends[b][0]] == 1
+        and deg[ends[b][1]] == 1
+    ]
     candidates = _mergeable(mol, bonds, ends)
     print(f"  ring-ring torsions (always dropped):      {len(hard)}  -> {len(hard) + len(merged_deg)}")
     print(f"  terminal torsions (deg 1 on both ends):   {len(merged_deg)}")
-    print(f"  actually tried for merging:               {len(candidates)} "
-          f"({100 * len(candidates) / max(len(bonds), 1):.1f}% of all torsions)")
+    print(
+        f"  actually tried for merging:               {len(candidates)} "
+        f"({100 * len(candidates) / max(len(bonds), 1):.1f}% of all torsions)"
+    )
 
     # Of the candidates, how many ended up merged, and how many were rejected as non-rigid?
     merged = [b for b in candidates if b not in frag.cut_bonds]
@@ -81,12 +89,13 @@ def diagnose(path: Path) -> None:
     degree_hist = defaultdict(int)
     for a, d in deg.items():
         degree_hist[d] += 1
-    print("  rotatable-bond graph, heavy atoms by number of incident torsions: "
-          + ", ".join(f"deg{d}={c}" for d, c in sorted(degree_hist.items())))
+    print(
+        "  rotatable-bond graph, heavy atoms by number of incident torsions: "
+        + ", ".join(f"deg{d}={c}" for d, c in sorted(degree_hist.items()))
+    )
 
     lowdeg = sum(1 for a, d in deg.items() if d == 1)
-    print(f"  atoms with a single incident torsion: {lowdeg} "
-          f"(each can end up as a 2-atom fragment's anchor)")
+    print(f"  atoms with a single incident torsion: {lowdeg} (each can end up as a 2-atom fragment's anchor)")
 
 
 def main(argv: list[str] | None = None) -> None:

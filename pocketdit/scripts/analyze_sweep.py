@@ -27,8 +27,17 @@ def load(paths: list[Path]) -> list[dict]:
         with open(path, newline="") as f:
             rows.extend(csv.DictReader(f))
     for r in rows:
-        for k in ("atoms", "torsions", "cuts", "fragments", "collinear", "min_size", "max_size",
-                  "torsions_filtered", "cuts_filtered"):
+        for k in (
+            "atoms",
+            "torsions",
+            "cuts",
+            "fragments",
+            "collinear",
+            "min_size",
+            "max_size",
+            "torsions_filtered",
+            "cuts_filtered",
+        ):
             r[k] = int(r[k])
         r["hist"] = {int(k): int(v) for k, v in (kv.split(":") for kv in r["size_hist"].split(";") if kv)}
     return rows
@@ -78,8 +87,10 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  degenerate fragments      {degenerate:7d} / {total_frags}  =  {pct(degenerate, total_frags)}")
     print(f"    of which 2-atom         {two_atom:7d}         =  {pct(two_atom, total_frags)}")
     print(f"    of which 1-atom         {one_atom:7d}         =  {pct(one_atom, total_frags)}")
-    print(f"    collinear with >=3 atoms{degenerate - two_atom - one_atom:7d}         =  "
-          f"{pct(degenerate - two_atom - one_atom, total_frags)}")
+    print(
+        f"    collinear with >=3 atoms{degenerate - two_atom - one_atom:7d}         =  "
+        f"{pct(degenerate - two_atom - one_atom, total_frags)}"
+    )
 
     mol_frac = np.array([r["collinear"] / r["fragments"] for r in rows])
     print(f"\n  per-molecule share         {quantiles(mol_frac)}")
@@ -119,8 +130,21 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  merged back (rigid)        {total_tors - total_cuts}  {pct(total_tors - total_cuts, total_tors)}")
 
     print("\n  torsion count histogram (molecules per bin)")
-    bins = [(0, 0), (1, 2), (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (13, 15), (16, 20),
-            (21, 25), (26, 30), (31, 40), (41, 10**6)]
+    bins = [
+        (0, 0),
+        (1, 2),
+        (3, 4),
+        (5, 6),
+        (7, 8),
+        (9, 10),
+        (11, 12),
+        (13, 15),
+        (16, 20),
+        (21, 25),
+        (26, 30),
+        (31, 40),
+        (41, 10**6),
+    ]
     counts = [sum(1 for t in tors if lo <= t <= hi) for lo, hi in bins]
     scale = max(counts)
     for (lo, hi), c in zip(bins, counts, strict=True):
@@ -130,17 +154,23 @@ def main(argv: list[str] | None = None) -> None:
     print("\n  torsion count by whether the molecule stays in one fragment")
     single = [r for r in rows if r["fragments"] == 1]
     multi = [r for r in rows if r["fragments"] > 1]
-    print(f"    single-fragment molecules  {len(single):6d}  {pct(len(single), n_mol)}  "
-          f"mean torsions {np.mean([r['torsions'] for r in single]) if single else 0:.2f}")
-    print(f"    split molecules            {len(multi):6d}  {pct(len(multi), n_mol)}  "
-          f"mean torsions {np.mean([r['torsions'] for r in multi]) if multi else 0:.2f}"
-          f"  mean fragments {np.mean([r['fragments'] for r in multi]) if multi else 0:.2f}")
+    print(
+        f"    single-fragment molecules  {len(single):6d}  {pct(len(single), n_mol)}  "
+        f"mean torsions {np.mean([r['torsions'] for r in single]) if single else 0:.2f}"
+    )
+    print(
+        f"    split molecules            {len(multi):6d}  {pct(len(multi), n_mol)}  "
+        f"mean torsions {np.mean([r['torsions'] for r in multi]) if multi else 0:.2f}"
+        f"  mean fragments {np.mean([r['fragments'] for r in multi]) if multi else 0:.2f}"
+    )
 
     # ---------------------------------------------------------------- fragments per molecule
     print("\n## Fragments per molecule\n")
     print(f"  {quantiles([r['fragments'] for r in rows])}")
-    print(f"  molecules with exactly one {sum(1 for r in rows if r['fragments'] == 1):6d}  "
-          f"{pct(sum(1 for r in rows if r['fragments'] == 1), n_mol)}")
+    print(
+        f"  molecules with exactly one {sum(1 for r in rows if r['fragments'] == 1):6d}  "
+        f"{pct(sum(1 for r in rows if r['fragments'] == 1), n_mol)}"
+    )
     print(f"  mean atoms per fragment    {total_atoms / total_frags:.2f}")
     print(f"  mean fragments per torsion {total_frags / total_tors:.3f}")
 
@@ -148,15 +178,19 @@ def main(argv: list[str] | None = None) -> None:
     print("\n## Variant: ignore_conjugated=True (drops weak conjugation, e.g. ester C-O)\n")
     tf = sum(r["torsions_filtered"] for r in rows)
     cf = sum(r["cuts_filtered"] for r in rows)
-    print(f"  torsions {tf} ({tf - total_tors:+d} vs default)   cuts {cf} ({cf - total_cuts:+d})   "
-          f"cut share {pct(cf, tf)}")
+    print(
+        f"  torsions {tf} ({tf - total_tors:+d} vs default)   cuts {cf} ({cf - total_cuts:+d})   "
+        f"cut share {pct(cf, tf)}"
+    )
 
     # ---------------------------------------------------------------- worst offenders
     print(f"\n## {args.top} molecules with the most degenerate fragments\n")
     print(f"  {'name':10s} {'atoms':>5s} {'tors':>5s} {'cuts':>5s} {'frags':>5s} {'degen':>5s} {'share':>6s}")
     for r in ranked[: args.top]:
-        print(f"  {r['name']:10s} {r['atoms']:5d} {r['torsions']:5d} {r['cuts']:5d} {r['fragments']:5d} "
-              f"{r['collinear']:5d} {100 * r['collinear'] / r['fragments']:5.1f}%")
+        print(
+            f"  {r['name']:10s} {r['atoms']:5d} {r['torsions']:5d} {r['cuts']:5d} {r['fragments']:5d} "
+            f"{r['collinear']:5d} {100 * r['collinear'] / r['fragments']:5.1f}%"
+        )
 
 
 if __name__ == "__main__":
