@@ -1,0 +1,48 @@
+D:\Data_flie\data\pdbbind\PDBBind_processed\1iwq\1iwq_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\1o5p\1o5p_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\1oqp\1oqp_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\1wc1\1wc1_ligand.sdf	ValueError: Could not parse a molecule from D:\Data_flie\data\pdbbind\PDBBind_processed\1wc1\1wc1_ligand.mol2
+D:\Data_flie\data\pdbbind\PDBBind_processed\1uti\1uti_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\2jld\2jld_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\2krd\2krd_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\2kvm\2kvm_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\2l6e\2l6e_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\2lgf\2lgf_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\2llo\2llo_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\2llq\2llq_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\2lsr\2lsr_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\2n3k\2n3k_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\2qki\2qki_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\3mmr\3mmr_ligand.sdf	ValueError: Could not parse a molecule from D:\Data_flie\data\pdbbind\PDBBind_processed\3mmr\3mmr_ligand.mol2
+D:\Data_flie\data\pdbbind\PDBBind_processed\3oe0\3oe0_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\3rj7\3rj7_ligand.sdf	RuntimeError: Invariant Violation
+	bad lower bound
+	Violation occurred on line 204 in file Code\GraphMol\DistGeomHelpers\BoundsMatrixBuilder.cpp
+	Failed Expression: lb > DIST12_DELTA || clb > DIST12_DELTA
+	RDKIT: 2026.09.1
+	BOOST: 1_85
+
+D:\Data_flie\data\pdbbind\PDBBind_processed\3q4c\3q4c_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\3uvu\3uvu_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\3whw\3whw_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\4aom\4aom_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\4jhq\4jhq_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\4jfw\4jfw_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\4l3o\4l3o_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\4mdn\4mdn_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\4mzl\4mzl_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\4u5t\4u5t_ligand.sdf	ValueError: Could not parse a molecule from D:\Data_flie\data\pdbbind\PDBBind_processed\4u5t\4u5t_ligand.mol2
+D:\Data_flie\data\pdbbind\PDBBind_processed\4xkc\4xkc_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\5dhr\5dhr_ligand.sdf	ValueError: Could not parse a molecule from D:\Data_flie\data\pdbbind\PDBBind_processed\5dhr\5dhr_ligand.mol2
+D:\Data_flie\data\pdbbind\PDBBind_processed\5dhu\5dhu_ligand.sdf	ValueError: Could not parse a molecule from D:\Data_flie\data\pdbbind\PDBBind_processed\5dhu\5dhu_ligand.mol2
+D:\Data_flie\data\pdbbind\PDBBind_processed\5ly1\5ly1_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\5od5\5od5_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\5v2p\5v2p_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\5zjy\5zjy_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\5zjz\5zjz_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\5zml\5zml_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\6hub\6hub_ligand.sdf	ValueError: Could not parse a molecule from D:\Data_flie\data\pdbbind\PDBBind_processed\6hub\6hub_ligand.mol2
+D:\Data_flie\data\pdbbind\PDBBind_processed\6hvr\6hvr_ligand.sdf	ValueError: Could not parse a molecule from D:\Data_flie\data\pdbbind\PDBBind_processed\6hvr\6hvr_ligand.mol2
+D:\Data_flie\data\pdbbind\PDBBind_processed\6q38\6q38_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\6qfu\6qfu_ligand.sdf	ValueError: Bad Conformer Id
+D:\Data_flie\data\pdbbind\PDBBind_processed\6qfv\6qfv_ligand.sdf	ValueError: Bad Conformer Id
