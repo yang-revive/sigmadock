@@ -13,6 +13,9 @@ import torch
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
+from pocketdit.fragment import Fragmentation
+from pocketdit.rigid import fragment_targets, gauge_of
+
 # --------------------------------------------------------------------------------------
 # Vocabularies. Anything not listed maps to the last index ("other / unknown").
 # --------------------------------------------------------------------------------------
@@ -142,6 +145,62 @@ def featurize_ligand(mol: Chem.Mol) -> dict[str, torch.Tensor]:
         "chiral_nbrs": torch.from_numpy(nbrs.astype(np.int64)),
         "chiral_sign": torch.from_numpy(sign),
     }
+
+
+def featurize_fragments(
+    mol: Chem.Mol, frag: Fragmentation, template_pos: np.ndarray, target_pos: np.ndarray | None = None
+) -> dict[str, torch.Tensor]:
+    """The rigid-fragment description of a ligand, plus its per-fragment target when a pose is given.
+
+    Always: which fragment every atom is in (``frag_idx``), every atom's template coordinates
+    relative to its own fragment's template centroid (``frag_local``, so a fragment at rotation R and
+    translation T puts atom i at ``R @ local_i + T``), and each fragment's gauge (``frag_free`` and
+    the free axis ``frag_axis``, in the template frame) -- all the model needs to turn one transform
+    per fragment into coordinates and back.
+
+    With ``target_pos`` (training data), also the target of ``rigid.fragment_targets``: where each
+    fragment centroid goes (``frag_trans``) and *every* rotation tied with the best fit
+    (``frag_rot`` [F, K, 3, 3], ``frag_rot_mask`` [F, K]), so the flow can pick the one nearest its
+    own state. ``frag_pairing`` [K, n] is which true atom each atom is fitted onto under its
+    fragment's k-th solution; padded slots keep the identity and are masked out.
+    """
+    n = mol.GetNumAtoms()
+    template = np.asarray(template_pos, dtype=np.float64).reshape(n, 3)
+    num = frag.num_fragments
+    local = np.zeros((n, 3))
+    kind = np.zeros(num, dtype=np.int64)
+    axis = np.zeros((num, 3))
+    for f in range(num):
+        atoms = np.flatnonzero(frag.frag_idx == f)
+        local[atoms] = template[atoms] - template[atoms].mean(0)
+        kind[f], axis[f] = gauge_of(local[atoms])
+    out = {
+        "frag_idx": torch.from_numpy(frag.frag_idx.astype(np.int64)),
+        "frag_local": torch.from_numpy(local.astype(np.float32)),
+        "frag_free": torch.from_numpy(kind),
+        "frag_axis": torch.from_numpy(axis.astype(np.float32)),
+    }
+    if target_pos is None:
+        return out
+
+    tgt = fragment_targets(mol, frag, target_pos, template)
+    k = max(len(s) for s in tgt.solutions)
+    rot = np.tile(np.eye(3), (num, k, 1, 1))
+    valid = np.zeros((num, k), dtype=bool)
+    pairing = np.tile(np.arange(n, dtype=np.int64), (k, 1))
+    for f, (sols, pairs) in enumerate(zip(tgt.solutions, tgt.solution_pairings, strict=True)):
+        rot[f, : len(sols)] = sols
+        valid[f, : len(sols)] = True
+        pairing[: len(sols), frag.frag_idx == f] = pairs
+    out.update(
+        {
+            "frag_trans": torch.from_numpy(tgt.trans.astype(np.float32)),
+            "frag_rot": torch.from_numpy(rot.astype(np.float32)),
+            "frag_rot_mask": torch.from_numpy(valid),
+            "frag_pairing": torch.from_numpy(pairing),
+        }
+    )
+    return out
 
 
 # --------------------------------------------------------------------------------------

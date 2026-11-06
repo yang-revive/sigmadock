@@ -11,6 +11,11 @@
 Symmetry: the trunk only sees distances and chirality volumes (SE(3)-invariant) and the head
 outputs a weighted sum of relative vectors, so x̂_1 is SE(3)-equivariant by construction.
 No rotation augmentation is needed.
+
+Fragment mode (``forward_fragments``) runs the very same trunk and head on the pose assembled
+from one rigid transform per fragment, and turns the per-atom displacements into a force and a
+torque per fragment -- the rigid motion that best explains them (``rigid_motion``). The predicted
+transform is ``(exp(omega) R_t, T_t + v)``, equivariant for the same reason as x̂_1.
 """
 
 from __future__ import annotations
@@ -22,7 +27,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from pocketdit import so3
 from pocketdit.chem import LIG_FEATURE_SIZES, NUM_BOND_TYPES, NUM_SPD, POCKET_FEATURE_SIZES
+from pocketdit.rigid import GAUGE_AXIS, GAUGE_FULL
+
+INERTIA_DAMPING = 0.05  # Å², added to every fragment's inertia before it is inverted, see rigid_motion
 
 
 @dataclass
@@ -214,6 +223,76 @@ class GeometricHead(nn.Module):
         return (w_ll.unsqueeze(-1) * r_ll).sum(2) / n_l + (w_lp.unsqueeze(-1) * r_lp).sum(2) / n_p
 
 
+# --------------------------------------------------------------------------------------
+# Fragment mode: one rigid transform per fragment
+# --------------------------------------------------------------------------------------
+def fragment_onehot(batch: dict, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """[B, F, N], 1 where atom n belongs to fragment f (padding atoms belong to none)."""
+    num = batch["frag_free"].shape[1]
+    onehot = batch["frag_idx"][:, None, :] == torch.arange(num, device=batch["frag_idx"].device)[None, :, None]
+    return (onehot & batch["lig_mask"][:, None, :]).to(dtype)
+
+
+def _per_atom(batch: dict, per_fragment: torch.Tensor) -> torch.Tensor:
+    """Broadcast a [B, F, ...] tensor to the atoms: [B, N, ...]."""
+    b = torch.arange(per_fragment.shape[0], device=per_fragment.device)[:, None]
+    return per_fragment[b, batch["frag_idx"]]
+
+
+def assemble(batch: dict, rot: torch.Tensor, trans: torch.Tensor) -> torch.Tensor:
+    """Atom coordinates [B, N, 3] of the pose with fragment f at ``(rot[f], trans[f])``.
+
+    Atom i goes to ``R_f @ local_i + T_f``: the template fragment, rotated about its own centroid,
+    with the centroid put at ``T_f``. Internal geometry is the template's whatever the transforms.
+    """
+    local = batch["frag_local"].to(rot.dtype)
+    x = (_per_atom(batch, rot) @ local.unsqueeze(-1)).squeeze(-1) + _per_atom(batch, trans)
+    return x * batch["lig_mask"].unsqueeze(-1)
+
+
+def rigid_motion(
+    delta: torch.Tensor, x: torch.Tensor, rot: torch.Tensor, trans: torch.Tensor, batch: dict
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Force and torque per fragment: the rigid motion ``(omega, v)`` closest to the displacements.
+
+    Least squares over ``v + omega x r_i ≈ Δx_i`` (r_i relative to the fragment centroid, which is
+    ``trans``) gives ``v = mean Δx_i``, the force, and ``I omega = mean r_i x Δx_i``, the torque, with
+    ``I = mean(|r|² 1 - r r^T)`` the fragment's inertia. Solving with the inertia rather than taking
+    the torque as it is matters: a ring's in-plane and out-of-plane moments differ by two, so a raw
+    torque would turn it at different rates for the same displacements depending on the axis.
+
+    ``INERTIA_DAMPING`` keeps the solve finite where a moment is close to zero, and how small it can
+    be is set by the smallest real moment, which is not where one would guess: a bent three-atom
+    fragment -- the most common size -- turns about the axis through its two outer atoms with a
+    moment of only 0.09-0.18 Å² on the examples (two-atom fragments: 0.43-0.56; rings: 0.6 and up).
+    Damping trades fidelity on that axis against the gain of the map, and both ends cost. At
+    0.05 Å² a perfectly rigid displacement field comes back shrunk by at most 36% about the weak
+    axis and by 5% in the median (0.1: 53% / 9%). At 0.02 (18% / 2%) the gain is high enough that
+    one of five single-complex overfits stalled at 2.1 Å, where 0.05 and 0.1 all reached 0.3-0.8 Å.
+
+    The gauge is removed explicitly. A collinear fragment's torque has no component along its own
+    axis in exact arithmetic, and the target never asks for one (it is pinned to the nearest member
+    of the gauge circle, whose relative rotation is perpendicular to the axis); projecting it out
+    keeps a nearly collinear fragment from amplifying rounding through its tiny axial moment. A
+    single atom has no rotation at all.
+    """
+    onehot = fragment_onehot(batch, delta.dtype)
+    count = onehot.sum(-1).clamp(min=1)[..., None]  # [B, F, 1]
+    force = onehot @ delta / count
+    r = x - _per_atom(batch, trans)
+    torque = onehot @ torch.linalg.cross(r, delta) / count
+    eye = torch.eye(3, dtype=x.dtype, device=x.device)
+    outer = (r * r).sum(-1)[..., None, None] * eye - r.unsqueeze(-1) * r.unsqueeze(-2)  # [B, N, 3, 3]
+    inertia = torch.einsum("bfn,bnij->bfij", onehot, outer) / count[..., None]
+    omega = torch.linalg.solve(inertia + INERTIA_DAMPING * eye, torque.unsqueeze(-1)).squeeze(-1)
+
+    kind = batch["frag_free"]
+    axis = (rot @ batch["frag_axis"].to(rot.dtype).unsqueeze(-1)).squeeze(-1)  # the free axis, world frame
+    omega = torch.where((kind == GAUGE_AXIS)[..., None], omega - (omega * axis).sum(-1, keepdim=True) * axis, omega)
+    omega = torch.where((kind == GAUGE_FULL)[..., None], torch.zeros_like(omega), omega)
+    return omega, force
+
+
 class PocketDiT(nn.Module):
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
@@ -237,6 +316,30 @@ class PocketDiT(nn.Module):
 
     def forward(self, batch: dict, x_t: torch.Tensor, t: torch.Tensor, h_p: torch.Tensor | None = None) -> torch.Tensor:
         """Predict the clean ligand pose x̂_1 [B, N, 3] (Å) from the noisy pose x_t at time t [B]."""
+        return (x_t + self.displacement(batch, x_t, t, h_p)) * batch["lig_mask"].unsqueeze(-1)
+
+    def forward_fragments(
+        self, batch: dict, rot: torch.Tensor, trans: torch.Tensor, t: torch.Tensor, h_p: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Predict the clean transform of every fragment from the current ones at time t [B].
+
+        ``rot`` [B, F, 3, 3] and ``trans`` [B, F, 3] (Å) place each fragment's template, rotated about
+        its centroid and with the centroid put at ``trans``. Returns ``(R̂_1, T̂_1)`` in the same form.
+        The trunk and head are the all-atom ones, run on the assembled pose; only the read-out of
+        their per-atom displacements differs (``rigid_motion``). Zero-initialised, it returns its
+        input, like ``forward``.
+        """
+        x_t = assemble(batch, rot, trans)
+        delta = self.displacement(batch, x_t, t, h_p)
+        with torch.autocast(device_type=x_t.device.type, enabled=False):
+            rot, trans = rot.float(), trans.float()
+            omega, force = rigid_motion(delta.float(), x_t.float(), rot, trans, batch)
+            return so3.exp(omega) @ rot, trans + force
+
+    def displacement(
+        self, batch: dict, x_t: torch.Tensor, t: torch.Tensor, h_p: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """The head's per-atom equivariant displacement Δx [B, N, 3] at pose x_t and time t [B]."""
         if h_p is None:
             h_p = self.encode_pocket(batch)
         lig_mask, poc_mask, x_p = batch["lig_mask"], batch["poc_mask"], batch["poc_pos"]
@@ -254,5 +357,4 @@ class PocketDiT(nn.Module):
         for blk in self.blocks:
             h = blk(h, c, h_p, z_ll, z_lp, lig_pad, poc_pad)
 
-        delta = self.head(h, c, h_p, z_ll, z_lp, x_t, x_p, lig_mask, poc_mask)
-        return (x_t + delta) * lig_mask.unsqueeze(-1)
+        return self.head(h, c, h_p, z_ll, z_lp, x_t, x_p, lig_mask, poc_mask)

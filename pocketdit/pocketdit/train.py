@@ -21,8 +21,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from pocketdit.data import ComplexDataset, PocketCrop, collate, to_device
-from pocketdit.flow import FlowConfig, centroid_error, flow_matching_loss, rmsd, sample
-from pocketdit.model import ModelConfig, PocketDiT
+from pocketdit.flow import FlowConfig, centroid_error, flow_matching_loss, pose_rmsd, rmsd, sample, select_targets
+from pocketdit.model import ModelConfig, PocketDiT, assemble
 
 
 @dataclass
@@ -97,7 +97,7 @@ def ema_update(ema: torch.nn.Module, model: torch.nn.Module, decay: float) -> No
 @torch.no_grad()
 def validate(model: PocketDiT, loader: DataLoader, cfg: TrainConfig, device: torch.device) -> dict[str, float]:
     model.eval()
-    losses, rmsds, centroids = [], [], []
+    losses, rmsds, centroids, floors = [], [], [], []
     for batch in loader:
         batch = to_device(batch, device)
         with autocast(cfg, device):
@@ -105,7 +105,15 @@ def validate(model: PocketDiT, loader: DataLoader, cfg: TrainConfig, device: tor
             losses.append(m["loss"])
             if len(rmsds) < cfg.val_num_sampled:
                 x = sample(model, batch, cfg.flow)
-                rmsds.extend(rmsd(x, batch["lig_pos"], batch["lig_mask"]).tolist())
+                if cfg.flow.fragments:
+                    # Against the true pose, scored under each fragment's best tied labelling, next
+                    # to the floor: what the same metric gives the best pose the templates can take.
+                    rmsds.extend(pose_rmsd(x, batch).tolist())
+                    eye = torch.eye(3, device=device).expand_as(batch["frag_rot"][:, :, 0])
+                    target = assemble(batch, select_targets(batch, eye)[0], batch["frag_trans"])
+                    floors.extend(pose_rmsd(target, batch).tolist())
+                else:
+                    rmsds.extend(rmsd(x, batch["lig_pos"], batch["lig_mask"]).tolist())
                 centroids.extend(centroid_error(x, batch["lig_pos"], batch["lig_mask"]).tolist())
     model.train()
     out = {"val/loss": sum(losses) / len(losses)}
@@ -114,6 +122,8 @@ def validate(model: PocketDiT, loader: DataLoader, cfg: TrainConfig, device: tor
         out.update({"val/rmsd_median": r.median().item(), "val/rmsd<2A": (r < 2.0).float().mean().item()})
         # Compare against the same number on a cross-docked set: see flow.centroid_error.
         out["val/centroid_err_median"] = c.median().item()
+    if floors:
+        out["val/floor_median"] = torch.tensor(floors).median().item()
     return out
 
 
@@ -137,6 +147,8 @@ def save(path: Path, model, ema, opt, sched, step: int, cfg: TrainConfig) -> Non
 
 def main(argv: list[str] | None = None) -> None:
     cfg = parse_config(argv)
+    if cfg.flow.rot_loss not in ("chordal", "geodesic"):
+        raise ValueError(f"--flow.rot_loss must be chordal or geodesic, got {cfg.flow.rot_loss!r}")
     torch.manual_seed(cfg.seed)
     device = torch.device(("cuda" if torch.cuda.is_available() else "cpu") if cfg.device == "auto" else cfg.device)
     out_dir = Path(cfg.out_dir)
@@ -144,13 +156,13 @@ def main(argv: list[str] | None = None) -> None:
     (out_dir / "config.json").write_text(json.dumps(asdict(cfg), indent=2))
 
     loader_kw = {"collate_fn": collate, "num_workers": cfg.num_workers, "persistent_workers": cfg.num_workers > 0}
-    train_ds = ComplexDataset(cfg.train_dir, cfg.crop, train=True)
+    train_ds = ComplexDataset(cfg.train_dir, cfg.crop, train=True, fragments=cfg.flow.fragments)
     batch_size = min(cfg.batch_size, len(train_ds))
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True, **loader_kw)
     val_loader = None
     if cfg.val_dir:
         # train=False: the deterministic shell, so validation numbers are comparable across steps.
-        val_ds = ComplexDataset(cfg.val_dir, cfg.crop, train=False)
+        val_ds = ComplexDataset(cfg.val_dir, cfg.crop, train=False, fragments=cfg.flow.fragments)
         val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, **loader_kw)
 
     model = PocketDiT(cfg.model).to(device)

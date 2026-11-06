@@ -1,5 +1,6 @@
 import json
 
+import pytest
 import torch
 from rdkit import Chem
 
@@ -58,3 +59,65 @@ def test_dock_from_an_explicit_centre(tmp_path):
     # A pose generated from a bare centre still lands inside the pocket, not out in solvent.
     pos = poses[0].GetConformer().GetPositions()
     assert ((pos - centre) ** 2).sum(axis=1).max() ** 0.5 < 25.0
+
+
+def test_fragment_mode_end_to_end(tmp_path):
+    """--fragments caches the targets, --flow.fragments trains on them, and docking reads the mode
+    back from the checkpoint."""
+    cache, run = tmp_path / "cache", tmp_path / "run"
+    data.main(["--root", str(DUMMY), "--out", str(cache), "--workers", "1", "--fragments"])
+    files = sorted(cache.glob("*.pt"))
+    assert len(files) == 10
+    item = torch.load(files[0], weights_only=True)
+    assert set(data.FRAGMENT_KEYS + data.FRAGMENT_TARGET_KEYS) <= set(item)
+    assert len(item["frag_idx"]) == len(item["lig_pos"])
+
+    train.main(["--train_dir", str(cache), "--val_dir", str(cache), "--out_dir", str(run), "--max_steps", "4",
+                "--batch_size", "4", "--num_workers", "0", "--log_every", "2", "--val_every", "4",
+                "--val_num_sampled", "4", "--flow.num_steps", "3", "--flow.fragments", "true", *TINY])  # fmt: skip
+    logged = [json.loads(line) for line in (run / "log.jsonl").read_text().splitlines()]
+    assert all("rot_loss" in entry for entry in logged if "coord_mse" in entry)
+    floors = [entry["val/floor_median"] for entry in logged if "val/floor_median" in entry]
+    assert len(floors) == 1 and 0 < floors[0] < 0.3  # ETKDG templates, as cached
+    ckpt = torch.load(run / "last.pt", map_location="cpu", weights_only=True)
+    assert ckpt["config"]["flow"]["fragments"] is True
+
+    folder = DUMMY / "1G9V_RQ3"
+    dock.main(["--ckpt", str(run / "last.pt"), "--protein", str(folder / "1G9V_RQ3_protein.pdb"),
+               "--ligand", str(folder / "query_1V4S_MRK.sdf"), "--ref", str(folder / "1G9V_RQ3_ligand.sdf"),
+               "--num_samples", "3", "--template", "etkdg", "--out_dir", str(tmp_path / "docked")])  # fmt: skip
+    poses = [m for m in Chem.SDMolSupplier(str(tmp_path / "docked" / "1G9V_RQ3__query_1V4S_MRK.sdf")) if m]
+    assert len(poses) == 3
+    assert all(pose.HasProp("max_joint_dev") for pose in poses)
+
+
+def test_fragment_training_needs_a_fragment_cache(tmp_path):
+    cache = tmp_path / "cache"
+    data.main(["--root", str(DUMMY), "--out", str(cache), "--workers", "1"])
+    with pytest.raises(ValueError, match="--fragments"):
+        train.main(["--train_dir", str(cache), "--out_dir", str(tmp_path / "run"), "--max_steps", "1",
+                    "--num_workers", "0", "--flow.fragments", "true", *TINY])  # fmt: skip
+
+
+def test_a_ligand_over_the_fragment_cap_is_filed_as_a_failure(tmp_path):
+    """Over rigid.MAX_LIGAND_ATOMS the fragment target refuses, and preprocessing lists the
+    complex in failures.txt rather than caching something that cannot be trained on."""
+    from rdkit.Chem import AllChem
+
+    mol = Chem.AddHs(Chem.MolFromSmiles("C" * 52))
+    AllChem.EmbedMolecule(mol, randomSeed=0)
+    site = Chem.SDMolSupplier(str(DUMMY / "1U1C_BAU" / "1U1C_BAU_ligand.sdf"))[0].GetConformer().GetPositions()
+    conf = mol.GetConformer()  # into the binding site, or there is no pocket to cut
+    shift = site.mean(0) - conf.GetPositions().mean(0)
+    for i, p in enumerate(conf.GetPositions() + shift):
+        conf.SetAtomPosition(i, p.tolist())
+    folder = tmp_path / "data" / "big"
+    folder.mkdir(parents=True)
+    with Chem.SDWriter(str(folder / "big_ligand.sdf")) as w:
+        w.write(Chem.RemoveHs(mol))
+    (folder / "big_protein.pdb").write_text((DUMMY / "1U1C_BAU" / "1U1C_BAU_protein.pdb").read_text())
+    data.main(["--root", str(tmp_path / "data"), "--out", str(tmp_path / "plain"), "--workers", "1"])
+    data.main(["--root", str(tmp_path / "data"), "--out", str(tmp_path / "frag"), "--workers", "1", "--fragments"])
+    assert len(list((tmp_path / "plain").glob("*.pt"))) == 1  # the all-atom cache is not capped at 50
+    assert not list((tmp_path / "frag").glob("*.pt"))
+    assert "out of scope" in (tmp_path / "frag" / "failures.txt").read_text()

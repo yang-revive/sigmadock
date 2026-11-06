@@ -13,10 +13,14 @@ from dataclasses import dataclass
 from multiprocessing import Pool
 from pathlib import Path
 
+import numpy as np
 import torch
+from rdkit import Chem
 from torch.utils.data import Dataset
 
-from pocketdit.chem import featurize_complex, load_ligand
+from pocketdit.chem import featurize_complex, featurize_fragments, load_ligand
+from pocketdit.fragment import fragment
+from pocketdit.rigid import MAX_LIGAND_ATOMS, embed_template, load_template
 
 # --------------------------------------------------------------------------------------
 # Index of complexes: (protein.pdb, ligand.sdf, optional reference.sdf)
@@ -56,8 +60,27 @@ def complex_name(row: Row) -> str:
 # --------------------------------------------------------------------------------------
 # Preprocessing
 # --------------------------------------------------------------------------------------
-def _process(job: tuple[Row, Path, float, float, int]) -> str | None:
-    (protein, ligand, ref), out_dir, cutoff, com_cutoff, max_atoms = job
+def fragment_template(mol: Chem.Mol, ligand: Path, template: str) -> np.ndarray:
+    """The internal geometry a fragment-mode complex is trained with, in ``mol``'s atom order.
+
+    ``"etkdg"``: a fresh conformer, the honest choice -- it is the kind of geometry inference is
+    handed, so the floor of the parameterisation is trained against rather than hidden.
+    ``"crystal"``: the true pose itself, which makes the floor zero and leaks the bound pucker of
+    every saturated ring. Anything else is a glob next to the ligand, e.g.
+    ``"*_ligand_start_conf.sdf"``.
+    """
+    if template == "etkdg":
+        return embed_template(mol)
+    if template == "crystal":
+        return mol.GetConformer().GetPositions()
+    found = sorted(ligand.parent.glob(template))
+    if not found:
+        raise ValueError(f"no template matching {template!r} next to {ligand}")
+    return load_template(mol, found[0])
+
+
+def _process(job: tuple[Row, Path, float, float, int, bool, str]) -> str | None:
+    (protein, ligand, ref), out_dir, cutoff, com_cutoff, max_atoms, fragments, template = job
     name = complex_name((protein, ligand, ref))
     try:
         mol = load_ligand(ligand)
@@ -65,6 +88,14 @@ def _process(job: tuple[Row, Path, float, float, int]) -> str | None:
             raise ValueError(f"{mol.GetNumAtoms()} heavy atoms > {max_atoms}")
         ref_pos = load_ligand(ref).GetConformer().GetPositions() if ref else mol.GetConformer().GetPositions()
         item = featurize_complex(protein, mol, ref_pos, pocket_cutoff=cutoff, com_cutoff=com_cutoff)
+        if fragments:
+            # Filed as a failure rather than cached: a pose that cannot be trained on (see rigid).
+            # Checked before the ETKDG embedding, which is the slow part on exactly these ligands.
+            if mol.GetNumAtoms() > MAX_LIGAND_ATOMS:
+                raise ValueError(f"{mol.GetNumAtoms()} heavy atoms > {MAX_LIGAND_ATOMS}: out of scope for fragments")
+            frag = fragment(mol, selection="compact")
+            start = fragment_template(mol, ligand, template)
+            item.update(featurize_fragments(mol, frag, start, target_pos=mol.GetConformer().GetPositions()))
         item["name"] = name
         torch.save(item, out_dir / f"{name}.pt")
         return None
@@ -73,11 +104,18 @@ def _process(job: tuple[Row, Path, float, float, int]) -> str | None:
 
 
 def preprocess(
-    rows: list[Row], out_dir: str | Path, pocket_cutoff: float, com_cutoff: float, max_atoms: int, workers: int
+    rows: list[Row],
+    out_dir: str | Path,
+    pocket_cutoff: float,
+    com_cutoff: float,
+    max_atoms: int,
+    workers: int,
+    fragments: bool = False,
+    template: str = "etkdg",
 ) -> None:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    jobs = [(row, out_dir, pocket_cutoff, com_cutoff, max_atoms) for row in rows]
+    jobs = [(row, out_dir, pocket_cutoff, com_cutoff, max_atoms, fragments, template) for row in rows]
     if workers > 1:
         with Pool(workers) as pool:
             errors = [e for e in pool.imap_unordered(_process, jobs, chunksize=8) if e]
@@ -180,6 +218,8 @@ class PocketCrop:
 
 
 DROPPED_BY_CROP = ("poc_res_id", "poc_res_dmin", "ref_pos", "ref_radius", "poc_cache_cutoff")
+FRAGMENT_KEYS = ("frag_idx", "frag_local", "frag_free", "frag_axis")  # what the model needs to place fragments
+FRAGMENT_TARGET_KEYS = ("frag_trans", "frag_rot", "frag_rot_mask", "frag_pairing")  # and to train on them
 
 
 def _residue_distance(poc_pos: torch.Tensor, ref: torch.Tensor, res_id: torch.Tensor, n_res: int) -> torch.Tensor:
@@ -283,19 +323,29 @@ def crop_pocket(item: dict, crop: PocketCrop, train: bool = False) -> dict:
 class ComplexDataset(Dataset):
     """Cached complexes, with the pocket narrowed to ``crop`` as each one is loaded."""
 
-    def __init__(self, cache_dir: str | Path, crop: PocketCrop | None = None, train: bool = False) -> None:
+    def __init__(
+        self, cache_dir: str | Path, crop: PocketCrop | None = None, train: bool = False, fragments: bool = False
+    ) -> None:
         self.files = sorted(Path(cache_dir).glob("*.pt"))
         if not self.files:
             raise FileNotFoundError(f"No cached complexes in {cache_dir}")
         self.crop = crop or PocketCrop()
         self.train = train
+        first = torch.load(self.files[0], weights_only=True)
+        if fragments:
+            missing = [k for k in FRAGMENT_KEYS + FRAGMENT_TARGET_KEYS if k not in first]
+            if missing:
+                raise ValueError(
+                    f"{cache_dir} has no fragment targets (missing {', '.join(missing)}); re-run "
+                    f"pocketdit.data with --fragments to train with --flow.fragments"
+                )
         # The crop can only select residues the cache holds, so a perturbed shell reaching past the
         # cache radius would be silently clipped on that side -- which is the one thing the
         # perturbation is supposed to avoid. How far it reaches scales with the reference's own
         # extent, so every complex is checked as it is loaded; this is the early warning for the
         # common case of a cache that is simply too narrow for the configured crop.
         if train:
-            _check_cache_headroom(torch.load(self.files[0], weights_only=True), self.crop)
+            _check_cache_headroom(first, self.crop)
 
     def __len__(self) -> int:
         return len(self.files)
@@ -333,6 +383,47 @@ def collate(items: list[dict]) -> dict:
         out["poc_feat"][b, :m] = it["poc_feat"]
         out["poc_pos"][b, :m] = it["poc_pos"]
         out["poc_mask"][b, :m] = True
+    if all("frag_idx" in it for it in items):
+        out.update(_collate_fragments(items, N))
+    return out
+
+
+def _collate_fragments(items: list[dict], N: int) -> dict:
+    """Pad fragments to the largest F and tied solutions to the largest K in the batch.
+
+    Padded fragments get the identity as their solution and padded atoms keep their own index as
+    their pairing, so every padded slot is a harmless no-op; ``frag_mask`` and ``frag_rot_mask``
+    say which ones are real.
+    """
+    B = len(items)
+    F = max(len(it["frag_free"]) for it in items)
+    out = {
+        "frag_idx": torch.zeros(B, N, dtype=torch.long),
+        "frag_local": torch.zeros(B, N, 3),
+        "frag_free": torch.zeros(B, F, dtype=torch.long),
+        "frag_axis": torch.zeros(B, F, 3),
+        "frag_mask": torch.zeros(B, F, dtype=torch.bool),
+    }
+    targets = all("frag_rot" in it for it in items)
+    if targets:
+        K = max(it["frag_rot"].shape[1] for it in items)
+        out["frag_trans"] = torch.zeros(B, F, 3)
+        out["frag_rot"] = torch.eye(3).repeat(B, F, K, 1, 1)
+        out["frag_rot_mask"] = torch.zeros(B, F, K, dtype=torch.bool)
+        out["frag_pairing"] = torch.arange(N).repeat(B, K, 1)
+    for b, it in enumerate(items):
+        n, f = len(it["frag_idx"]), len(it["frag_free"])
+        out["frag_idx"][b, :n] = it["frag_idx"]
+        out["frag_local"][b, :n] = it["frag_local"]
+        out["frag_free"][b, :f] = it["frag_free"]
+        out["frag_axis"][b, :f] = it["frag_axis"]
+        out["frag_mask"][b, :f] = True
+        if targets:
+            k = it["frag_rot"].shape[1]
+            out["frag_trans"][b, :f] = it["frag_trans"]
+            out["frag_rot"][b, :f, :k] = it["frag_rot"]
+            out["frag_rot_mask"][b, :f, :k] = it["frag_rot_mask"]
+            out["frag_pairing"][b, :k, :n] = it["frag_pairing"]
     return out
 
 
@@ -357,13 +448,27 @@ def main(argv: list[str] | None = None) -> None:
     )
     p.add_argument("--com_cutoff", type=float, default=6.0, help="shell whose CoM becomes the prior centre")
     p.add_argument("--max_atoms", type=int, default=128, help="skip ligands with more heavy atoms")
+    p.add_argument(
+        "--fragments",
+        action="store_true",
+        help="also cache rigid fragments and their SE(3) targets (needed for --flow.fragments); "
+        "ligands over rigid.MAX_LIGAND_ATOMS heavy atoms are then listed as failures",
+    )
+    p.add_argument(
+        "--template",
+        default="etkdg",
+        help='with --fragments, the fixed internal geometry: "etkdg" (a fresh conformer), "crystal" '
+        '(the true pose), or a glob next to each ligand such as "*_ligand_start_conf.sdf"',
+    )
     p.add_argument("--workers", type=int, default=8)
     args = p.parse_args(argv)
     if args.root:
         rows = index_from_folders(args.root, args.protein_glob, args.ligand_glob, args.ref_glob)
     else:
         rows = index_from_csv(args.csv)
-    preprocess(rows, args.out, args.pocket_cutoff, args.com_cutoff, args.max_atoms, args.workers)
+    preprocess(
+        rows, args.out, args.pocket_cutoff, args.com_cutoff, args.max_atoms, args.workers, args.fragments, args.template
+    )
 
 
 if __name__ == "__main__":

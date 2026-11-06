@@ -108,6 +108,14 @@ class FragmentTargets:
     relabelled: np.ndarray  # [F] bool, a non-identity relabelling won the fit
     num_relabellings: np.ndarray  # [F] how many relabellings were fitted, the identity included
     num_symmetries: np.ndarray  # [F] how many of those are rotations of the template, i.e. exact ties
+    gauge_kind: np.ndarray  # [F] GAUGE_NONE / GAUGE_AXIS / GAUGE_FULL, see ``gauge_of``
+    gauge_axis: np.ndarray  # [F, 3] the free axis in the template frame, zero unless GAUGE_AXIS
+    # Every solution tied with the best fit, in enumeration order, gauge pinned against the
+    # reference: per fragment [K_f, 3, 3] rotations and [K_f, size_f] the true atom each fragment
+    # atom is fitted onto. ``rot`` is the one of them nearest the reference. They are what a flow
+    # needs to re-select the nearest target against its own state without refitting anything.
+    solutions: tuple[np.ndarray, ...]
+    solution_pairings: tuple[np.ndarray, ...]
 
     @property
     def num_fragments(self) -> int:
@@ -196,6 +204,27 @@ def free_axis(pos: np.ndarray, tol: float = COLLINEAR_TOL) -> np.ndarray | None:
     return vt[0]
 
 
+GAUGE_NONE, GAUGE_AXIS, GAUGE_FULL = 0, 1, 2
+
+
+def gauge_of(template: np.ndarray, tol: float = COLLINEAR_TOL) -> tuple[int, np.ndarray]:
+    """Which rotations leave a centred fragment where it is: ``(kind, axis)``.
+
+    ``GAUGE_NONE`` for a fragment that pins its rotation down, ``GAUGE_AXIS`` with the line
+    direction for a collinear one, ``GAUGE_FULL`` for a single atom (or coincident atoms), where
+    every rotation is free. The axis is zero unless the kind is ``GAUGE_AXIS``. This is the one
+    description of the gauge used everywhere -- by ``pin_gauge`` here and by the model, which
+    has to keep its own rotation update off exactly the same axis.
+    """
+    template = np.asarray(template, dtype=np.float64)
+    if len(template) == 1 or np.allclose(template, template.mean(0), atol=tol):
+        return GAUGE_FULL, np.zeros(3)
+    axis = free_axis(template, tol)
+    if axis is None:
+        return GAUGE_NONE, np.zeros(3)
+    return GAUGE_AXIS, axis / max(float(np.linalg.norm(axis)), 1e-12)
+
+
 def pin_gauge(
     rot: np.ndarray, template: np.ndarray, reference: np.ndarray, tol: float = COLLINEAR_TOL
 ) -> tuple[np.ndarray, bool]:
@@ -211,13 +240,11 @@ def pin_gauge(
     ``template`` has to be centred on the point the rotation acts about, since that is what puts
     the free axis through the origin and leaves the fragment's own atoms fixed under it.
     """
-    template = np.asarray(template, dtype=np.float64)
-    if len(template) == 1 or np.allclose(template, template.mean(0), atol=tol):
+    kind, a = gauge_of(template, tol)
+    if kind == GAUGE_FULL:
         return np.asarray(reference, dtype=np.float64).copy(), True
-    axis = free_axis(template, tol)
-    if axis is None:
+    if kind == GAUGE_NONE:
         return rot, False
-    a = axis / max(float(np.linalg.norm(axis)), 1e-12)
     k = np.array([[0.0, -a[2], a[1]], [a[2], 0.0, -a[0]], [-a[1], a[0], 0.0]])
     q = np.asarray(reference, dtype=np.float64).T @ rot
     return rot @ rotation_about(a, math.atan2(float(np.trace(q @ k)), -float(np.trace(q @ k @ k)))), True
@@ -341,6 +368,12 @@ def fragment_targets(
     of the template and the gauge circle of a collinear fragment, which is to say everything the
     fit cannot see. Pass ``reference=R_t`` to resolve against the state of a flow instead.
 
+    The whole tied set comes back as well (``solutions``), because the reference of a flow is
+    random and changes every step: refitting each time is out of the question, but which tied
+    solution is nearest -- with its gauge re-pinned -- is a cheap batched choice the model side
+    makes itself (``flow.select_targets``), and it agrees with passing that reference here.
+    ``reference`` may be one rotation or one per fragment.
+
     Ligands with more than ``max_atoms`` heavy atoms raise instead of returning a target; pass
     ``max_atoms=None`` to compute them anyway.
     """
@@ -366,6 +399,9 @@ def fragment_targets(
     relabelled = np.zeros(num, dtype=bool)
     num_relabellings = np.zeros(num, dtype=np.int64)
     num_symmetries = np.zeros(num, dtype=np.int64)
+    gauge_kind = np.zeros(num, dtype=np.int64)
+    gauge_axis = np.zeros((num, 3))
+    solutions, solution_pairings = [], []
 
     for f in range(num):
         atoms = np.flatnonzero(frag.frag_idx == f)
@@ -383,7 +419,11 @@ def fragment_targets(
             candidates.append((fit, rotation_distance(ref[f], r), i, r, t, perm, free))
 
         best = min(c[0] for c in candidates)
-        fit, _, _, r, t, perm, free = min((c for c in candidates if c[0] <= best + tie_tol), key=lambda c: c[1:3])
+        tied = [c for c in candidates if c[0] <= best + tie_tol]
+        fit, _, _, r, t, perm, free = min(tied, key=lambda c: c[1:3])
+        solutions.append(np.stack([c[3] for c in tied]))
+        solution_pairings.append(np.stack([atoms[c[5]] for c in tied]))
+        gauge_kind[f], gauge_axis[f] = gauge_of(centred)
 
         rot[f], trans[f], center[f] = r, t, template[atoms].mean(0)
         pos[atoms] = centred @ r.T + t
@@ -394,7 +434,22 @@ def fragment_targets(
         num_relabellings[f] = len(perms)
         num_symmetries[f] = sum(is_template_symmetry(centred, p, sym_tol) for p in perms)
 
-    return FragmentTargets(rot, trans, center, pos, rmsd, pairing, gauge, relabelled, num_relabellings, num_symmetries)
+    return FragmentTargets(
+        rot,
+        trans,
+        center,
+        pos,
+        rmsd,
+        pairing,
+        gauge,
+        relabelled,
+        num_relabellings,
+        num_symmetries,
+        gauge_kind,
+        gauge_axis,
+        tuple(solutions),
+        tuple(solution_pairings),
+    )
 
 
 def embed_template(mol: Chem.Mol, seed: int = 0xC0FFEE) -> np.ndarray:

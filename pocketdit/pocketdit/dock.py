@@ -9,6 +9,12 @@ Cross-docking / real use: define the pocket with a reference ligand or an explic
 Many complexes: ``--csv`` with columns protein,ligand[,ref] (paths relative to the CSV).
 Each complex writes ``<out_dir>/<name>.sdf`` with ``--num_samples`` poses (unranked).
 
+A fragment-mode checkpoint (``--flow.fragments``) cuts the query into rigid fragments and keeps
+their internal geometry from ``--template``: the input conformer by default, or a fresh ETKDG one.
+Re-docking a crystal ligand with the default hands the model the bound geometry, so benchmark with
+``--template etkdg``. Each pose then also records ``max_joint_dev``, the most any cut bond is
+stretched or squashed against the template (the one length nothing holds rigid).
+
 The pocket budget and the prior come from the checkpoint, so docking reproduces the pocket the
 model was trained on without having to repeat any flags. A reference ligand is the better input of
 the two: ``--center`` gives a point, and the pocket then has to be a ball around it (see
@@ -27,10 +33,12 @@ from rdkit import Chem
 from rdkit.Chem import rdMolAlign
 from rdkit.Geometry import Point3D
 
-from pocketdit.chem import featurize_complex, load_ligand
+from pocketdit.chem import featurize_complex, featurize_fragments, load_ligand
 from pocketdit.data import PocketCrop, collate, complex_name, crop_pocket, index_from_csv, to_device
 from pocketdit.flow import FlowConfig, sample
+from pocketdit.fragment import fragment
 from pocketdit.model import ModelConfig, PocketDiT
+from pocketdit.rigid import embed_template, joint_errors
 
 
 def load_model(
@@ -65,6 +73,7 @@ def dock(
     pocket_cutoff: float,
     center_margin: float,
     device: torch.device,
+    template: str = "input",
 ) -> list[Chem.Mol]:
     mol = load_ligand(ligand)
     explicit_center = ref is None and center is not None
@@ -80,6 +89,16 @@ def dock(
     margin = center_margin if explicit_center else 0.0
     item = featurize_complex(protein, mol, ref_pos, pocket_cutoff=pocket_cutoff + margin)
     item = crop_pocket(item, replace(crop, cutoff=crop.cutoff + margin, core_cutoff=crop.core_cutoff + margin))
+    frag, start = None, None
+    if flow.fragments:
+        frag = fragment(mol, selection="compact")
+        if template == "input":
+            start = mol.GetConformer().GetPositions()
+        elif template == "etkdg":
+            start = embed_template(mol)
+        else:
+            raise ValueError(f"template must be 'input' or 'etkdg', got {template!r}")
+        item.update(featurize_fragments(mol, frag, start))
     batch = to_device(collate([item] * num_samples), device)
     poses = sample(model, batch, flow, num_steps).cpu().numpy()
     out = []
@@ -88,6 +107,8 @@ def dock(
         pose.SetProp("_Name", f"{complex_name((protein, ligand, ref))}_sample{k}")
         # Only meaningful for re-docking, where the input ligand is the crystal pose.
         pose.SetDoubleProp("rmsd_to_input", rdMolAlign.CalcRMS(pose, mol))
+        if frag is not None:
+            pose.SetDoubleProp("max_joint_dev", float(joint_errors(mol, frag, pos, start).max(initial=0.0)))
         out.append(pose)
     return out
 
@@ -110,6 +131,12 @@ def main(argv: list[str] | None = None) -> None:
         type=float,
         default=6.0,
         help="with --center, how far past the shell to reach (roughly a ligand radius)",
+    )
+    p.add_argument(
+        "--template",
+        default="input",
+        choices=("input", "etkdg"),
+        help="fragment-mode checkpoints: internal geometry from the input conformer or a fresh ETKDG one",
     )
     p.add_argument("--no_ema", action="store_true")
     p.add_argument("--seed", type=int, default=0)
@@ -142,6 +169,7 @@ def main(argv: list[str] | None = None) -> None:
             pocket_cutoff=args.pocket_cutoff,
             center_margin=args.center_margin,
             device=device,
+            template=args.template,
         )
         with Chem.SDWriter(str(out_dir / f"{complex_name(row)}.sdf")) as w:
             for pose in poses:
