@@ -150,6 +150,49 @@ def test_fragment_kind():
 
 
 # --------------------------------------------------------------------------------------
+# Conformer generation
+# --------------------------------------------------------------------------------------
+MACROCYCLE = "O=C1CCCCCCCCCCC(=O)NCCCCN1"
+
+
+@pytest.mark.parametrize("seed", [0, 1, 42])
+def test_conformers_differ_for_every_seed(seed):
+    """Seed 0 used to give copies of one conformer, which made best-of-N a single draw."""
+    confs = sweep.conformers(embedded(MACROCYCLE), 4, seed, timeout=30)
+    assert len(confs) == 4
+    assert sweep.conformer_spread(confs) > 0.5
+
+
+def test_conformers_keep_the_atom_order_and_stereo():
+    mol = embedded("C[C@@H](N)C(=O)N[C@H](C)c1ccccc1")
+    crystal = mol.GetConformer().GetPositions()
+    confs = sweep.conformers(mol, 3, 0, timeout=30)
+    assert all(c.shape == crystal.shape for c in confs)
+    assert sweep.chiral_flips(mol, crystal, confs) == 0
+    bonded = [(b.GetBeginAtomIdx(), b.GetEndAtomIdx()) for b in mol.GetBonds()]
+    for c in confs:  # every bond still bond-length apart, i.e. the heavy atoms were not reordered
+        assert all(1.1 < np.linalg.norm(c[i] - c[j]) < 1.7 for i, j in bonded)
+
+
+def test_conformers_survive_a_timeout(monkeypatch):
+    """A timed-out embedding returns [-1] with no conformer behind it."""
+    monkeypatch.setattr(sweep.AllChem, "EmbedMultipleConfs", lambda mol, num, params: [-1])
+    assert sweep.conformers(embedded("CCc1ccccc1"), 3, 0, timeout=1) == []
+
+
+def test_conformers_survive_an_rdkit_invariant(monkeypatch):
+    def raise_invariant(mol, num, params):
+        raise RuntimeError("Invariant Violation: bad lower bound")
+
+    monkeypatch.setattr(sweep.AllChem, "EmbedMultipleConfs", raise_invariant)
+    assert sweep.conformers(embedded("CCc1ccccc1"), 3, 0, timeout=1) == []
+
+
+def test_conformer_spread_blank_below_two():
+    assert sweep.conformer_spread([]) == "" and sweep.conformer_spread([np.zeros((3, 3))]) == ""
+
+
+# --------------------------------------------------------------------------------------
 # A whole complex and the command line
 # --------------------------------------------------------------------------------------
 @pytest.fixture(scope="module")
@@ -165,7 +208,7 @@ def test_measure_one_complex(measured):
     row, frag_rows = measured
     assert set(row) == set(sweep.COMPLEX_FIELDS)
     assert all(set(r) == set(sweep.FRAGMENT_FIELDS) for r in frag_rows)
-    assert row["n_conf"] == 3 and row["chiral_flip_confs"] == 0
+    assert row["n_conf"] == 3 and row["chiral_flip_confs"] == 0 and row["conf_spread"] > 0.1
     assert row["oracle_best"] <= row["oracle_mean"] < 0.5 < row["rigid_best"]
     # 1R1H has four stereocentres; every one sits at a cut, as the fragment module predicts
     assert row["stereocentres"] == row["split_centres"] == 4
@@ -186,3 +229,35 @@ def test_cli_end_to_end(tmp_path, capsys):
     report = capsys.readouterr().out
     for section in ("## 1.", "## 2.", "## 3.", "## 4.", "## 5.", "## 6.", "## Joint count"):
         assert section in report
+
+
+def test_measure_without_conformers_still_measures_the_rest(monkeypatch):
+    if not DUMMY.exists():
+        pytest.skip(f"example data not found at {DUMMY}")
+    monkeypatch.setattr(sweep, "conformers", lambda *args: [])
+    opts = {"num_confs": 3, "embed_timeout": 30, "random_samples": 3, "seed": 0, "protein_glob": "*_protein.pdb"}
+    folder = DUMMY / "1R1H_BIR"
+    row, frag_rows = sweep.measure(folder / "1R1H_BIR_ligand.sdf", folder / "1R1H_BIR_protein.pdb", opts)
+    assert row["n_conf"] == 0 and row["oracle_best"] == "" and row["conf_spread"] == ""
+    assert row["split_centres"] == 4 and all(r["rmsd_min"] == "" for r in frag_rows)
+
+
+def test_names_file_and_later_files_override(tmp_path):
+    """A re-run of a subset, passed after the full sweep, replaces those complexes."""
+    if not DUMMY.exists():
+        pytest.skip(f"example data not found at {DUMMY}")
+    common = ["--root", str(DUMMY), "--workers", "1", "--num_confs", "2", "--random_samples", "2"]
+    full, rerun = tmp_path / "full.csv", tmp_path / "rerun.csv"
+    sweep.main([*common, "--out", str(full), "--limit", "3"])
+    names = tmp_path / "names.txt"
+    names.write_text("# comment\n1HWI_115  # trailing comment\n\nnot_a_complex\n")
+    sweep.main([*common, "--out", str(rerun), "--names_file", str(names), "--seed", "5"])
+
+    only, _ = analyze.load([rerun])
+    assert [m["name"] for m in only] == ["1HWI_115"]
+    merged, frags = analyze.load([full, rerun])
+    first, _ = analyze.load([full])
+    assert sorted(m["name"] for m in merged) == sorted(m["name"] for m in first)
+    picked = next(m for m in merged if m["name"] == "1HWI_115")
+    assert picked["seconds"] == only[0]["seconds"]  # the row came from the re-run
+    assert len(frags) == sum(m["fragments"] for m in merged)  # fragments replaced, not appended

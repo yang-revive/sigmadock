@@ -65,7 +65,7 @@ MAX_AUTOMORPHISMS = 10_000
 COMPLEX_FIELDS = [
     "name", "atoms", "torsions", "cuts", "fragments",
     # 1. rigid-fragment floor
-    "n_conf", "chiral_flip_confs", "oracle_best", "oracle_mean", "rigid_best",
+    "n_conf", "conf_spread", "chiral_flip_confs", "oracle_best", "oracle_mean", "rigid_best",
     "dist_rmse", "joint_err_mean", "joint_err_max",
     # 2. stereocentres
     "stereocentres", "split_centres",
@@ -127,19 +127,37 @@ def conformers(mol: Chem.Mol, num: int, seed: int, timeout: int) -> list[np.ndar
     """Heavy-atom coordinates of ``num`` ETKDG + force-field conformers, in ``mol``'s atom order.
 
     Stereo is read from the crystal pose first, so every conformer is the same stereoisomer
-    (``chiral_flip_confs`` checks that it actually is).
+    (``chiral_flip_confs`` checks that it actually is). Returns an empty list when embedding
+    fails, times out or trips an RDKit invariant, so the rest of the complex is still measured.
+
+    Two RDKit behaviours this guards against, both of which cost the first full-PDBBind run:
+
+    * ``randomSeed = 0`` without sequential seeds makes ``EmbedMultipleConfs`` return ``num``
+      copies of one conformer (any other seed does not). Sequential seeds give seed, seed + 1, ...
+      and never degenerate; ``conf_spread`` reports the diversity so it cannot happen silently.
+    * a timeout returns ``[-1]`` rather than an empty list, with no conformer behind it, so the
+      ids are read back from the molecule instead of trusted.
     """
     work = Chem.Mol(mol)
     Chem.AssignStereochemistryFrom3D(work)
-    work = Chem.AddHs(work, addCoords=True)  # hydrogens go after the heavy atoms
+    work = Chem.AddHs(work)  # hydrogens go after the heavy atoms; the stereo tags carry over
+    # Never let the crystal pose itself pass for a generated conformer, whatever the embedder does.
+    work.RemoveAllConformers()
     params = AllChem.ETKDGv3()
     params.randomSeed = seed
+    params.enableSequentialRandomSeeds = True
     params.numThreads = 1
     params.timeout = timeout
-    ids = list(AllChem.EmbedMultipleConfs(work, num, params))
-    if not ids:
-        params.useRandomCoords = True
-        ids = list(AllChem.EmbedMultipleConfs(work, num, params))
+    ids: list[int] = []
+    for random_coords in (False, True):
+        params.useRandomCoords = random_coords
+        try:
+            AllChem.EmbedMultipleConfs(work, num, params)
+        except RuntimeError:  # e.g. "bad lower bound" from the bounds-matrix builder
+            return []
+        ids = [c.GetId() for c in work.GetConformers()]
+        if ids:
+            break
     if not ids:
         return []
     try:
@@ -151,6 +169,16 @@ def conformers(mol: Chem.Mol, num: int, seed: int, timeout: int) -> list[np.ndar
         pass
     n = mol.GetNumAtoms()
     return [work.GetConformer(i).GetPositions()[:n] for i in ids]
+
+
+def conformer_spread(confs: list[np.ndarray]) -> float | str:
+    """Mean RMSD of the other conformers to the first after superposition; blank for fewer than 2.
+
+    Near 0 for a rigid ligand, and for any ligand when the conformers are copies of one another.
+    """
+    if len(confs) < 2:
+        return ""
+    return float(np.mean([rmsd(kabsch_place(c, confs[0]), confs[0]) for c in confs[1:]]))
 
 
 def chiral_flips(mol: Chem.Mol, crystal: np.ndarray, confs: list[np.ndarray]) -> int:
@@ -350,6 +378,7 @@ def measure(lig_path: Path, prot_path: Path, opts: dict) -> tuple[dict, list[dic
         "cuts": len(frag.cut_bonds),
         "fragments": nf,
         "n_conf": len(confs),
+        "conf_spread": conformer_spread(confs),
         "chiral_flip_confs": chiral_flips(mol, crystal, confs),
         **floor,
         "stereocentres": len(centres),
@@ -395,6 +424,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--failures", type=Path)
     p.add_argument("--limit", type=int)
     p.add_argument("--prefixes", help="comma separated first letters of the complex names to keep")
+    p.add_argument("--names_file", type=Path, help="only these complexes: one name per line, '#' starts a comment")
     p.add_argument("--num_confs", type=int, default=5, help="ETKDG conformers per ligand")
     p.add_argument("--embed_timeout", type=int, default=60, help="ETKDG timeout per conformer, seconds")
     p.add_argument("--random_samples", type=int, default=20, help="seeds for selection='random'")
@@ -403,6 +433,10 @@ def main(argv: list[str] | None = None) -> None:
     args = p.parse_args(argv)
 
     paths = sorted(args.root.glob(args.glob))
+    if args.names_file:
+        lines = (line.split("#", 1)[0].strip() for line in args.names_file.read_text().splitlines())
+        names = {line for line in lines if line}
+        paths = [q for q in paths if (q.parent.name or q.stem) in names]
     if args.prefixes:
         wanted = set(args.prefixes.split(","))
         paths = [q for q in paths if (q.parent.name or q.stem)[:1] in wanted]

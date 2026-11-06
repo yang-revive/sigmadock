@@ -2,10 +2,15 @@
 
     python scripts/analyze_geometry_sweep.py geom_*.csv
 
-Each ``<name>.csv`` is read together with the ``<name>.fragments.csv`` next to it. Every section
-is reported over the whole set and split by ligand size (<= 50, 51-100, > 100 heavy atoms),
-because the earlier sweep showed the flexible tail behaving very differently from drug-like
-ligands.
+Each ``<name>.csv`` is read together with the ``<name>.fragments.csv`` next to it. A complex that
+appears in several files is taken from the last one, rows and fragments alike, so a re-run of a
+subset is merged by passing it after the full sweep:
+
+    python scripts/analyze_geometry_sweep.py geom.csv geom_rerun.csv
+
+Every section is reported over the whole set and split by ligand size (<= 50, 51-100, > 100 heavy
+atoms), because the earlier sweep showed the flexible tail behaving very differently from
+drug-like ligands.
 """
 
 from __future__ import annotations
@@ -21,7 +26,9 @@ import numpy as np
 TIERS = (("<=50", 0, 50), ("51-100", 51, 100), (">100", 101, 10**9))
 KINDS = ("aromatic", "aliphatic_ring", "macrocycle", "acyclic")
 CHI3_P95 = 2.7955  # 95th percentile of the norm of a standard 3D Gaussian
-FLOAT = ("oracle_best", "oracle_mean", "rigid_best", "dist_rmse", "joint_err_mean", "joint_err_max",
+RING_CLASSES = ("no saturated ring", "saturated ring", "macrocycle")
+CUT_CAPS = (10, 15, 20)
+FLOAT = ("conf_spread", "oracle_best", "oracle_mean", "rigid_best", "dist_rmse", "joint_err_mean", "joint_err_max",
          "rand_frags_mean", "lig_offset", "atom_offset_rms", "frag_offset_max", "seconds",
          "rmsd_min", "rmsd_mean", "dmin", "offset")  # fmt: skip
 
@@ -43,19 +50,32 @@ def _parse(row: dict) -> dict:
 
 
 def load(paths: list[Path]) -> tuple[list[dict], list[dict]]:
-    mols, frags = [], []
+    """Complex and fragment rows; a complex in several files is taken from the last one."""
+    mols: dict[str, dict] = {}
+    frags: dict[str, list[dict]] = {}
     for path in paths:
-        with open(path, newline="") as f:
-            mols.extend(_parse(r) for r in csv.DictReader(f))
         fpath = fragments_path(path)
         if not fpath.exists():
             sys.exit(f"missing {fpath}")
+        with open(path, newline="") as f:
+            rows = [_parse(r) for r in csv.DictReader(f)]
         with open(fpath, newline="") as f:
-            frags.extend(_parse(r) for r in csv.DictReader(f))
-    atoms = {m["name"]: m["atoms"] for m in mols}
-    for r in frags:
-        r["atoms"] = atoms[r["name"]]
-    return mols, frags
+            frag_rows = [_parse(r) for r in csv.DictReader(f)]
+        for r in rows:
+            mols[r["name"]] = r
+            frags[r["name"]] = []
+        for r in frag_rows:
+            frags[r["name"]].append(r)
+    for m in mols.values():
+        kinds = {r["kind"] for r in frags[m["name"]]}
+        m["ring_class"] = (
+            "macrocycle"
+            if "macrocycle" in kinds
+            else ("saturated ring" if "aliphatic_ring" in kinds else "no saturated ring")
+        )
+        for r in frags[m["name"]]:
+            r["atoms"] = m["atoms"]
+    return list(mols.values()), [r for rows in frags.values() for r in rows]
 
 
 def pct(a: float, b: float) -> str:
@@ -122,6 +142,31 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901 - one report, rea
     print(
         f"\n  conformer sets that invert a stereocentre (should be ~0)  {len(flips)}  {pct(len(flips), len(embedded))}"
     )
+    multi = [m for m in embedded if m["n_conf"] > 1]
+    if multi and "conf_spread" not in multi[0]:
+        print("  WARNING: no conf_spread column -- a run from before the seed fix, where every conformer of a")
+        print("           ligand was the same one. Read 'best' as a single-conformer floor, not best-of-N.")
+    elif multi:
+        flexible = [m for m in multi if m["torsions"] > 0]
+        same = [m for m in flexible if not m["conf_spread"] > 0.01]
+        print(
+            f"  flexible ligands whose conformers coincide (< 0.01 Å, should be small)  {len(same)}  "
+            f"{pct(len(same), len(flexible))}"
+        )
+
+    print("\n  by ring content: any macrocycle, else any saturated ring, else neither")
+    print(f"    {'':24s} {'n':>6s}   {'p50':>6s} {'p95':>6s} {'p99':>6s}   {'>0.5Å':>6s} {'>1Å':>6s}   joint>0.3Å")
+    for label, rows in tiered(embedded):
+        for cls in RING_CLASSES:
+            sub = [r for r in rows if r["ring_class"] == cls]
+            if not sub:
+                continue
+            v = np.array([r["oracle_best"] for r in sub])
+            print(
+                f"    {label + ', ' + cls:24s} {len(sub):6d}   {np.percentile(v, 50):6.3f} {np.percentile(v, 95):6.3f} "
+                f"{np.percentile(v, 99):6.3f}   {pct((v > 0.5).sum(), len(v))} {pct((v > 1).sum(), len(v))}   "
+                f"{share(sub, lambda r: r['joint_err_max'] > 0.3)}"
+            )
 
     print("\n  per-fragment RMSD (best conformer) by fragment kind")
     stats = " ".join(c.rjust(6) for c in ("mean", "p50", "p90", "p99"))
@@ -264,6 +309,19 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901 - one report, rea
             f"{share(rows, lambda r: r['cuts'] > 15)}  {share(rows, lambda r: r['cuts'] > 20)}"
             f"     (torsions > 20: {share(rows, lambda r: r['torsions'] > 20).strip()})"
         )
+
+    print("\n  candidate training filters (kept share of the parsed set, and the floor of what is kept)")
+    for cap in CUT_CAPS:
+        for drop_macro in (False, True):
+            kept = [m for m in embedded if m["cuts"] <= cap and not (drop_macro and m["ring_class"] == "macrocycle")]
+            if not kept:
+                continue
+            v = np.array([m["oracle_best"] for m in kept])
+            label = f"cuts <= {cap}" + (", no macrocycle" if drop_macro else "")
+            print(
+                f"    {label:28s} keep {pct(len(kept), len(embedded))}   floor p95 {np.percentile(v, 95):5.3f}  "
+                f"p99 {np.percentile(v, 99):5.3f}  > 1 Å {pct((v > 1).sum(), len(v))}"
+            )
 
     secs = np.array([m["seconds"] for m in mols])
     print(f"\nwall time per complex  {quantiles(secs)}")
