@@ -345,6 +345,34 @@ tiny 模型、8 个副本、600 步 Adam（lr 2e-3），与全原子的过拟合
 
 这只说明整条链路能学、而且不比全原子慢，不是 benchmark。
 
+## 训练集 ID 清单（`scripts/dataset_index.py`）
+
+数据根目录里有什么，不等于训练会看到什么。中间有三道关卡，每一道都会静默丢样本，所以清单要**生成出来并落盘**，而不是每次从目录现算：
+
+1. **能不能解析**——RDKit 要 kekulise + sanitise，全量上 7 个 SDF 读不出来（和 `geom.failures.txt` 里那 7 个 mol2 也读不出的完全一致）。
+2. **够不够小、够不够不柔**——重原子数用 `chem.load_ligand` 数，也就是去掉氢之后的 `GetNumAtoms()`，和 `fragment.py` / `rigid.py` 报的是同一个数；扭转键用 `fragment(...).rotatable_bonds`，和 `data.py` 的 `--max_torsions` 是同一个数。
+3. **会不会和验证集重叠**——`--val` / `--val_ids` 把验证集里的 ID 从训练集里摘掉，否则 PB 或 core 上的数字没有意义。
+
+```bash
+# 50 重原子的训练清单（rigid.MAX_LIGAND_ATOMS），兼作 SigDock 规则的对照
+python scripts/dataset_index.py --root <PDBBind_processed> --ligand_glob "*_ligand.sdf" \
+    --out data/pdbbind_v2020_50atoms/index --workers 8
+# 论文口径（扭转 ≤ 20 且 MW ≤ 750，无原子数上限）
+python scripts/dataset_index.py --root <PDBBind_processed> --ligand_glob "*_ligand.sdf" \
+    --out data/pdbbind_v2020_sigmadock/index --max_atoms 0 --max_torsions 20 --max_weight 750
+```
+
+每个 `--out` 写四个文件：`<stem>.train.txt`（通过全部规则的 ID，一行一个）、`<stem>.excluded.txt`（`ID<TAB>规则: 数值 > 阈值`，逐条写明为什么被丢）、`<stem>.val.txt`（给了 `--val`/`--val_ids` 才有）、`<stem>.summary.json`（每道关卡丢掉多少、原子/扭转的分位数、规则本身，以便复现）。全量 19,119 个的结果：
+
+| 规则 | 训练 ID | 丢掉 |
+|---|---|---|
+| 重原子 ≤ 50（`rigid` 的默认） | **16,796** | 2,316 原子数 + 7 解析 |
+| 扭转 ≤ 20 且 MW ≤ 750（SigmaDock 论文） | **16,500** | 2,259 扭转 + 353 质量 + 7 解析 |
+
+两份清单的 Jaccard 是 **0.974**（交集 16,431）：`50 原子` 里只有 365 个不在 SigmaDock 规则里（多为小肽、极性大的 >20 扭转分子），SigmaDock 规则里只有 69 个不在 50 原子里。**这就是"50 原子不等于把药样空间切掉"最直接的证据**——两份名单几乎是同一个东西，只是换了个阈值去切。想给 `rigid.fragment_targets` 换成 SigmaDock 口径时，把 `MAX_LIGAND_ATOMS` 设成 `None` 再叠 `max_torsions=20`，换来的就是那 69 个药样大分子、丢掉那 365 个柔性分子。
+
+注意 `--val` 只做**ID 交集**，不做蛋白同源性比对；它是"别直接混进训练集"的下限，不是时间切分的替代品。
+
 ## 已知局限和下一步
 
 - **两种模式都还没有在真实数据集上训练过**，没有 benchmark 数字。默认超参数（先验 4 Å、预算 256、cutoff 抖动 1.5 Å、距离损失权重等）都是合理的起点，没有经过调优。`crop.shell_dropout` 默认关着：cutoff 抖动已经在动边界了，再叠一层整残基 dropout 是否有用需要实测。

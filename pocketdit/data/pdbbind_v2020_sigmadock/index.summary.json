@@ -1,0 +1,38 @@
+{
+  "root": "D:\\Data_flie\\data\\pdbbind\\PDBBind_processed",
+  "glob": "*_ligand.sdf",
+  "rules": {
+    "max_atoms": null,
+    "max_torsions": 20,
+    "max_weight": 750.0
+  },
+  "found": 19119,
+  "train": 16500,
+  "val": 0,
+  "excluded": 2619,
+  "excluded_by_reason": {
+    "torsions": 2259,
+    "mw": 353,
+    "parse": 7
+  },
+  "atoms": {
+    "n": 19112,
+    "min": 4,
+    "p50": 28,
+    "p95": 81,
+    "max": 224
+  },
+  "torsions": {
+    "n": 19112,
+    "min": 0,
+    "p50": 6,
+    "p95": 41,
+    "max": 110
+  },
+  "files": {
+    "train": "data\\pdbbind_v2020_sigmadock\\index.train.txt",
+    "val": null,
+    "excluded": "data\\pdbbind_v2020_sigmadock\\index.excluded.txt"
+  },
+  "seconds": 21.8
+}
